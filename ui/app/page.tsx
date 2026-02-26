@@ -12,7 +12,6 @@ import {
   type PendingApproval,
   StateSyncPayloadSchema,
 } from '../lib/protocol';
-import crypto from 'crypto';
 
 const UI_BUILD_VERSION = process.env.UI_BUILD_VERSION || 'unknown';
 const DEFAULT_SESSION_NAME = 'main';
