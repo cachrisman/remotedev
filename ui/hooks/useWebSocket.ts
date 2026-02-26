@@ -39,7 +39,7 @@ interface UseWebSocketOptions {
 
 export interface UseWebSocketReturn {
   connectionState: ConnectionState;
-  send: (msg: Partial<BridgeMessage>) => void;
+  send: (msg: Partial<BridgeMessage> & { type: string }) => void;
   controllerEpoch: string | null;
 }
 
