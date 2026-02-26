@@ -6,6 +6,7 @@ node_modules/
 .env
 .env.local
 .env.*.local
+ecosystem.config.local.js
 *.log
 .DS_Store
 dist/
