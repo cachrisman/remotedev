@@ -19,7 +19,7 @@ const { startOrphanScan } = require('./orphan-scan');
 // ──────────────────────────────────────────────────────────────────────────
 // Configuration
 
-const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
+const PORT = parseInt(process.env.BRIDGE_PORT || '7001', 10);
 const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN;
 const CLIENT_SECRET = process.env.REMOTEDEV_CLIENT_SECRET;
 const TLS_CERT = process.env.TLS_CERT;

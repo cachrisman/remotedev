@@ -28,7 +28,7 @@ echo "→ Restarting remotedev-ui with updated env..."
 pm2 restart remotedev-ui --update-env
 
 echo "→ Waiting for bridge readiness..."
-BRIDGE_PORT="${BRIDGE_PORT:-3001}"
+BRIDGE_PORT="${BRIDGE_PORT:-7001}"
 MAX_WAIT=30
 WAITED=0
 

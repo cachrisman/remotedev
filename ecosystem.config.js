@@ -27,7 +27,7 @@ module.exports = {
       listen_timeout: 10000,
       env: {
         NODE_ENV: 'production',
-        BRIDGE_PORT: '3001',
+        BRIDGE_PORT: '7001',
         BRIDGE_AUTH_TOKEN: bridgeAuthToken,
         REMOTEDEV_CLIENT_SECRET: clientSecret,
         ALLOWED_ROOTS: allowedRoots,
@@ -40,13 +40,13 @@ module.exports = {
     {
       name: 'remotedev-ui',
       script: 'node_modules/.bin/next',
-      args: 'start --port 3000',
+      args: 'start --port 7000',
       cwd: `${__dirname}/ui`,
       wait_ready: false,
       env: {
         NODE_ENV: 'production',
         BRIDGE_AUTH_TOKEN: bridgeAuthToken,
-        NEXT_PUBLIC_BRIDGE_WS_URL: `wss://${host}:3001`,
+        NEXT_PUBLIC_BRIDGE_WS_URL: `wss://${host}:7001`,
         NEXT_PUBLIC_CLIENT_SECRET: clientSecret,
         NEXT_PUBLIC_WORKING_DIR: allowedRoots?.split(':')[0] || process.env.HOME,
         UI_BUILD_VERSION: Date.now().toString(),

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 const PROTOCOL_VERSION = 1;
-const BRIDGE_WS_URL = process.env.NEXT_PUBLIC_BRIDGE_WS_URL || 'wss://localhost:3001';
+const BRIDGE_WS_URL = process.env.NEXT_PUBLIC_BRIDGE_WS_URL || 'wss://localhost:7001';
 const CLIENT_SECRET = process.env.NEXT_PUBLIC_CLIENT_SECRET || '';
 const UI_BUILD_VERSION = process.env.UI_BUILD_VERSION || 'unknown';
 

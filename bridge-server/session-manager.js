@@ -38,7 +38,7 @@ class SessionManager {
   }
 
   activePids() {
-    return this.#sessions.values()
+    return [...this.#sessions.values()]
       .filter(s => s.proc && !s.proc.killed)
       .map(s => s.proc.pid)
       .filter(Boolean);

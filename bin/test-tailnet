@@ -7,8 +7,8 @@
 #   - TAILNET_HOST set (e.g., mac.tailnet-name.ts.net)
 #   - BRIDGE_AUTH_TOKEN set
 #   - REMOTEDEV_CLIENT_SECRET set
-#   - Bridge running on $TAILNET_HOST:3001
-#   - Next.js running on $TAILNET_HOST:3000
+#   - Bridge running on $TAILNET_HOST:7001
+#   - Next.js running on $TAILNET_HOST:7000
 #
 # Usage:
 #   ./bin/test-tailnet [--skip-manual]
@@ -17,8 +17,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TAILNET_HOST="${TAILNET_HOST:-localhost}"
-BRIDGE_PORT="${BRIDGE_PORT:-3001}"
-UI_PORT="${UI_PORT:-3000}"
+BRIDGE_PORT="${BRIDGE_PORT:-7001}"
+UI_PORT="${UI_PORT:-7000}"
 BRIDGE_AUTH_TOKEN="${BRIDGE_AUTH_TOKEN:-}"
 CLIENT_SECRET="${REMOTEDEV_CLIENT_SECRET:-}"
 SKIP_MANUAL="${1:-}"

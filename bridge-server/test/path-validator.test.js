@@ -50,7 +50,7 @@ describe('validatePath', () => {
   });
 
   it('rejects invalid path argument', () => {
-    const result = validatePath(null as unknown as string, tmpDir, resolvedRoots);
+    const result = validatePath(null, tmpDir, resolvedRoots);
     assert.equal(result.safe, false);
   });
 

@@ -18,7 +18,7 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const auth = require('./auth');
 
-const PORT = parseInt(process.env.BRIDGE_PORT || '3001', 10);
+const PORT = parseInt(process.env.BRIDGE_PORT || '7001', 10);
 const BRIDGE_AUTH_TOKEN = process.env.BRIDGE_AUTH_TOKEN || 'stub-token';
 const CLIENT_SECRET = process.env.REMOTEDEV_CLIENT_SECRET || 'stub-secret';
 const PROTOCOL_VERSION = 1;
