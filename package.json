@@ -1,0 +1,19 @@
+{
+  "name": "remotedev",
+  "version": "0.16.0",
+  "description": "Control your Mac dev environment from your iPhone via a mobile chat interface",
+  "private": true,
+  "workspaces": [
+    "bridge-server",
+    "ui"
+  ],
+  "scripts": {
+    "dev": "pm2 start ecosystem.config.js",
+    "reload": "./bin/reload",
+    "test": "node --test bridge-server/test/**/*.test.js",
+    "test:tailnet": "./bin/test-tailnet"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

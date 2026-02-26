@@ -1,0 +1,23 @@
+{
+  "name": "remotedev-bridge",
+  "version": "0.16.0",
+  "description": "RemoteDev bridge server",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "pino": "^8.19.0",
+    "re2": "^1.21.4",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "pino-pretty": "^11.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

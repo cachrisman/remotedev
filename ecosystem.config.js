@@ -1,0 +1,56 @@
+/**
+ * PM2 ecosystem config for RemoteDev.
+ *
+ * Environment variables to set before starting:
+ *   BRIDGE_AUTH_TOKEN   - random secret shared between bridge + Next.js server
+ *   REMOTEDEV_CLIENT_SECRET - 32-byte hex, stored in Keychain
+ *   TLS_CERT / TLS_KEY  - paths to tailscale cert (optional for local dev)
+ *   ALLOWED_ROOTS       - colon-separated list of allowed working dirs
+ *   TAILNET_HOST        - e.g. mac.tailnet-name.ts.net
+ *
+ * Generate BRIDGE_AUTH_TOKEN:
+ *   export BRIDGE_AUTH_TOKEN=$(openssl rand -hex 32)
+ */
+
+const host = process.env.TAILNET_HOST || 'localhost';
+const bridgeAuthToken = process.env.BRIDGE_AUTH_TOKEN;
+const clientSecret = process.env.REMOTEDEV_CLIENT_SECRET;
+const allowedRoots = process.env.ALLOWED_ROOTS || process.env.HOME;
+
+module.exports = {
+  apps: [
+    {
+      name: 'remotedev-bridge',
+      script: './bridge-server/index.js',
+      cwd: __dirname,
+      wait_ready: true,
+      listen_timeout: 10000,
+      env: {
+        NODE_ENV: 'production',
+        BRIDGE_PORT: '3001',
+        BRIDGE_AUTH_TOKEN: bridgeAuthToken,
+        REMOTEDEV_CLIENT_SECRET: clientSecret,
+        ALLOWED_ROOTS: allowedRoots,
+        TLS_CERT: process.env.TLS_CERT || `/var/lib/tailscale/certs/${host}.crt`,
+        TLS_KEY: process.env.TLS_KEY || `/var/lib/tailscale/certs/${host}.key`,
+        CLAUDE_MIN_VERSION: process.env.CLAUDE_MIN_VERSION || '0.0.0',
+        LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+      },
+    },
+    {
+      name: 'remotedev-ui',
+      script: 'node_modules/.bin/next',
+      args: 'start --port 3000',
+      cwd: `${__dirname}/ui`,
+      wait_ready: false,
+      env: {
+        NODE_ENV: 'production',
+        BRIDGE_AUTH_TOKEN: bridgeAuthToken,
+        NEXT_PUBLIC_BRIDGE_WS_URL: `wss://${host}:3001`,
+        NEXT_PUBLIC_CLIENT_SECRET: clientSecret,
+        NEXT_PUBLIC_WORKING_DIR: allowedRoots?.split(':')[0] || process.env.HOME,
+        UI_BUILD_VERSION: Date.now().toString(),
+      },
+    },
+  ],
+};

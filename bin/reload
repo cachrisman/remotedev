@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# bin/reload — Restart bridge + UI with a new BRIDGE_AUTH_TOKEN.
+#
+# Clients receive 4003 after reload and auto-recover via token refresh.
+# 4003-from-stale-assertion does NOT increment IP lockout counter.
+#
+# Requires: pm2, jq, openssl
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# Verify dependencies
+for cmd in pm2 jq openssl; do
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "Error: $cmd is required" >&2
+    exit 1
+  fi
+done
+
+echo "→ Generating new BRIDGE_AUTH_TOKEN..."
+NEW_TOKEN=$(openssl rand -hex 32)
+export BRIDGE_AUTH_TOKEN="$NEW_TOKEN"
+
+echo "→ Restarting remotedev-bridge with updated env..."
+pm2 restart remotedev-bridge --update-env
+
+echo "→ Restarting remotedev-ui with updated env..."
+pm2 restart remotedev-ui --update-env
+
+echo "→ Waiting for bridge readiness..."
+BRIDGE_PORT="${BRIDGE_PORT:-3001}"
+MAX_WAIT=30
+WAITED=0
+
+while [ $WAITED -lt $MAX_WAIT ]; do
+  if nc -z localhost "$BRIDGE_PORT" 2>/dev/null; then
+    echo "✓ Bridge ready on port $BRIDGE_PORT"
+    break
+  fi
+  sleep 1
+  WAITED=$((WAITED + 1))
+done
+
+if [ $WAITED -ge $MAX_WAIT ]; then
+  echo "⚠ Bridge did not become ready within ${MAX_WAIT}s" >&2
+  exit 1
+fi
+
+echo "✓ Reload complete. Clients will auto-recover on reconnect."
