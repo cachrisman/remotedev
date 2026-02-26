@@ -60,18 +60,24 @@ tailscale up
 [https://login.tailscale.com/admin/dns](https://login.tailscale.com/admin/dns) → scroll to **HTTPS Certificates** → Enable.
 
 ```bash
-# Get your machine's full Tailscale FQDN and provision a TLS cert:
-tailscale cert $(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")')
+# Get your machine's full Tailscale FQDN:
+TAILNET_HOST=$(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")')
+
+# Create the cert directory and provision the TLS cert there
+# (the project looks for certs at /var/lib/tailscale/certs/ by default)
+sudo mkdir -p /var/lib/tailscale/certs
+sudo tailscale cert --cert-file /var/lib/tailscale/certs/${TAILNET_HOST}.crt \
+                    --key-file  /var/lib/tailscale/certs/${TAILNET_HOST}.key \
+                    ${TAILNET_HOST}
 ```
 
-Configure Tailscale ACLs to allow your iPhone to reach your Mac on ports **7000** and **7001**:
-```json
-{
-  "acls": [
-    { "action": "accept", "src": ["tag:iphone"], "dst": ["tag:mac:7000", "tag:mac:7001"] }
-  ]
-}
-```
+> **Note:** If `tailscale cert` writes to the current directory instead (check for `<hostname>.crt` / `<hostname>.key` files), move them manually:
+> ```bash
+> sudo mv ${TAILNET_HOST}.crt ${TAILNET_HOST}.key /var/lib/tailscale/certs/
+> ```
+> Alternatively, set `TLS_CERT` and `TLS_KEY` in `.env.local` to point to wherever the files landed.
+
+**Tailscale ACLs (personal tailnet — skip this):** The default Tailscale ACL for a single-user account already allows all your devices to reach each other, so no ACL changes are needed. If you're on a shared or corporate tailnet with a restrictive ACL policy, you'll need to add rules allowing your iPhone to reach your Mac on ports **7000** and **7001** — consult your tailnet admin.
 
 ### 3. Run interactive setup
 
