@@ -42,7 +42,8 @@ module.exports = {
     {
       name: 'remotedev-ui',
       script: 'node_modules/.bin/next',
-      args: 'start --port 7000',
+      // Binds to localhost only — tailscale serve proxies https://<host>:7000 → here.
+      args: 'start --port 17000 --hostname 127.0.0.1',
       cwd: `${__dirname}/ui`,
       wait_ready: false,
       env: {
