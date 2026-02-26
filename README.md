@@ -54,17 +54,30 @@ cd ui && npm install && cd ..
 ```bash
 # Install Tailscale, then:
 tailscale up
-tailscale cert $(tailscale status --self | grep -oE '\S+\.ts\.net' | head -1)
 ```
 
-Configure Tailscale ACLs to allow your iPhone to reach your Mac on ports **7000** and **7001**:
-```json
-{
-  "acls": [
-    { "action": "accept", "src": ["tag:iphone"], "dst": ["tag:mac:7000", "tag:mac:7001"] }
-  ]
-}
+**Enable HTTPS certificates** in the Tailscale admin console before running `tailscale cert`:
+[https://login.tailscale.com/admin/dns](https://login.tailscale.com/admin/dns) → scroll to **HTTPS Certificates** → Enable.
+
+```bash
+# Get your machine's full Tailscale FQDN:
+TAILNET_HOST=$(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")')
+
+# Create the cert directory and provision the TLS cert there
+# (the project looks for certs at /var/lib/tailscale/certs/ by default)
+sudo mkdir -p /var/lib/tailscale/certs
+sudo tailscale cert --cert-file /var/lib/tailscale/certs/${TAILNET_HOST}.crt \
+                    --key-file  /var/lib/tailscale/certs/${TAILNET_HOST}.key \
+                    ${TAILNET_HOST}
 ```
+
+> **Note:** If `tailscale cert` writes to the current directory instead (check for `<hostname>.crt` / `<hostname>.key` files), move them manually:
+> ```bash
+> sudo mv ${TAILNET_HOST}.crt ${TAILNET_HOST}.key /var/lib/tailscale/certs/
+> ```
+> Alternatively, set `TLS_CERT` and `TLS_KEY` in `.env.local` to point to wherever the files landed.
+
+**Tailscale ACLs (personal tailnet — skip this):** The default Tailscale ACL for a single-user account already allows all your devices to reach each other, so no ACL changes are needed. If you're on a shared or corporate tailnet with a restrictive ACL policy, you'll need to add rules allowing your iPhone to reach your Mac on ports **7000** and **7001** — consult your tailnet admin.
 
 ### 3. Run interactive setup
 
@@ -72,33 +85,24 @@ Configure Tailscale ACLs to allow your iPhone to reach your Mac on ports **7000*
 ./bin/setup
 ```
 
-This generates secrets, stores the client secret in macOS Keychain, and writes `ecosystem.config.local.js`.
+This generates secrets, stores the client secret in macOS Keychain, and writes `ecosystem.config.local.js`. Copy the displayed client secret into iPhone Safari's password manager for your tailnet hostname.
 
-**After setup:** copy the displayed client secret into iPhone Safari's password manager for your tailnet hostname.
+`ecosystem.config.js` automatically loads `ecosystem.config.local.js` at startup — no sourcing needed.
 
-### 4. Configure environment
-
-Create `.env.local` from the template (or use the generated `ecosystem.config.local.js`):
-
-```bash
-cp .env.example .env.local
-# Fill in: BRIDGE_AUTH_TOKEN, REMOTEDEV_CLIENT_SECRET, TAILNET_HOST, ALLOWED_ROOTS
-```
-
-### 5. Build the UI
+### 4. Build the UI
 
 ```bash
 cd ui && npm run build && cd ..
 ```
 
-### 6. Start with pm2
+### 5. Start with pm2
 
 ```bash
 pm2 start ecosystem.config.js
 pm2 save  # persist across reboots
 ```
 
-### 7. iOS smoke gate (Phase 1a gate)
+### 6. iOS smoke gate (Phase 1a gate)
 
 Open `https://<your-tailnet-host>:7000` in iPhone Safari:
 1. Page loads without TLS warning
@@ -128,7 +132,7 @@ remotedev/
 │   ├── startup-checks.js   # Cert expiry, claude version, disk space
 │   ├── stub.js             # Canned-sequence stub for UI dev
 │   └── test/               # Node.js built-in test runner suite
-├── ui/                     # Next.js 14 mobile chat UI
+├── ui/                     # Next.js 16 mobile chat UI
 │   ├── app/
 │   │   ├── api/token/      # HMAC assertion endpoint (force-dynamic)
 │   │   └── page.tsx        # Main chat interface
