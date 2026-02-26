@@ -54,7 +54,14 @@ cd ui && npm install && cd ..
 ```bash
 # Install Tailscale, then:
 tailscale up
-tailscale cert $(tailscale status --self | grep -oE '\S+\.ts\.net' | head -1)
+```
+
+**Enable HTTPS certificates** in the Tailscale admin console before running `tailscale cert`:
+[https://login.tailscale.com/admin/dns](https://login.tailscale.com/admin/dns) → scroll to **HTTPS Certificates** → Enable.
+
+```bash
+# Get your machine's full Tailscale FQDN and provision a TLS cert:
+tailscale cert $(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")')
 ```
 
 Configure Tailscale ACLs to allow your iPhone to reach your Mac on ports **7000** and **7001**:
@@ -128,7 +135,7 @@ remotedev/
 │   ├── startup-checks.js   # Cert expiry, claude version, disk space
 │   ├── stub.js             # Canned-sequence stub for UI dev
 │   └── test/               # Node.js built-in test runner suite
-├── ui/                     # Next.js 14 mobile chat UI
+├── ui/                     # Next.js 16 mobile chat UI
 │   ├── app/
 │   │   ├── api/token/      # HMAC assertion endpoint (force-dynamic)
 │   │   └── page.tsx        # Main chat interface
