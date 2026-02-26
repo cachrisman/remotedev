@@ -35,6 +35,13 @@ class NdjsonFramer {
           continue;
         }
 
+        // Also catch long lines that arrive complete within a single push()
+        if (this._buf.length > this.maxLineBytes) {
+          this._buf = '';
+          this.onError(new Error('line_too_long'));
+          continue;
+        }
+
         const line = this._buf.trim();
         this._buf = '';
 
