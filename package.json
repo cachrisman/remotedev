@@ -14,6 +14,6 @@
     "test:tailnet": "./bin/test-tailnet"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20 <25"
   }
 }
