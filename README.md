@@ -85,33 +85,24 @@ sudo tailscale cert --cert-file /var/lib/tailscale/certs/${TAILNET_HOST}.crt \
 ./bin/setup
 ```
 
-This generates secrets, stores the client secret in macOS Keychain, and writes `ecosystem.config.local.js`.
+This generates secrets, stores the client secret in macOS Keychain, and writes `ecosystem.config.local.js`. Copy the displayed client secret into iPhone Safari's password manager for your tailnet hostname.
 
-**After setup:** copy the displayed client secret into iPhone Safari's password manager for your tailnet hostname.
+`ecosystem.config.js` automatically loads `ecosystem.config.local.js` at startup — no sourcing needed.
 
-### 4. Configure environment
-
-Create `.env.local` from the template (or use the generated `ecosystem.config.local.js`):
-
-```bash
-cp .env.example .env.local
-# Fill in: BRIDGE_AUTH_TOKEN, REMOTEDEV_CLIENT_SECRET, TAILNET_HOST, ALLOWED_ROOTS
-```
-
-### 5. Build the UI
+### 4. Build the UI
 
 ```bash
 cd ui && npm run build && cd ..
 ```
 
-### 6. Start with pm2
+### 5. Start with pm2
 
 ```bash
 pm2 start ecosystem.config.js
 pm2 save  # persist across reboots
 ```
 
-### 7. iOS smoke gate (Phase 1a gate)
+### 6. iOS smoke gate (Phase 1a gate)
 
 Open `https://<your-tailnet-host>:7000` in iPhone Safari:
 1. Page loads without TLS warning
