@@ -3,8 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 const PROTOCOL_VERSION = 1;
-const BRIDGE_WS_URL = process.env.NEXT_PUBLIC_BRIDGE_WS_URL || 'wss://localhost:7001';
-const CLIENT_SECRET = process.env.NEXT_PUBLIC_CLIENT_SECRET || '';
 const UI_BUILD_VERSION = process.env.UI_BUILD_VERSION || 'unknown';
 
 // Jittered reconnect backoff for 1011 (buffer overflow)
@@ -53,7 +51,7 @@ export function useWebSocket({
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cachedTokenRef = useRef<{ wsAuth: string; nonce: string; ts: number } | null>(null);
+  const cachedTokenRef = useRef<{ wsAuth: string; nonce: string; ts: number; bridgeWsUrl: string; clientSecret: string } | null>(null);
   const failureCountRef = useRef(0);
   const destroyedRef = useRef(false);
   const epochRef = useRef<string | null>(controllerEpoch);
@@ -72,6 +70,8 @@ export function useWebSocket({
     wsAuth: string;
     nonce: string;
     ts: number;
+    bridgeWsUrl: string;
+    clientSecret: string;
   }> => {
     const res = await fetch('/api/token');
     if (!res.ok) throw new Error('Failed to fetch token');
@@ -98,7 +98,7 @@ export function useWebSocket({
 
     let ws: WebSocket;
     try {
-      ws = new WebSocket(BRIDGE_WS_URL);
+      ws = new WebSocket(token.bridgeWsUrl);
     } catch {
       setConnectionState('error');
       scheduleReconnect(2000);
@@ -119,7 +119,7 @@ export function useWebSocket({
           wsAuth: token!.wsAuth,
           nonce: token!.nonce,
           ts: token!.ts,
-          clientSecret: CLIENT_SECRET,
+          clientSecret: token!.clientSecret,
         },
       }));
     };
