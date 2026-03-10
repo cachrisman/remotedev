@@ -681,7 +681,7 @@ iPhone Safari  →  https://<host>:7000  →  tailscale serve  →  http://local
 
 ### AGENTS.md added
 
-**Date:** February 2026
+**Commit:** `469a02b`
 
 Added `AGENTS.md` to the repository root. This file provides guidelines for Claude Code and other AI agents working in this codebase: project layout, non-negotiable security rules, code style conventions, development workflow, test instructions, common pitfalls, and references to key documentation.
 
@@ -691,7 +691,7 @@ Added `AGENTS.md` to the repository root. This file provides guidelines for Clau
 
 ### Spawn Claude under PTY (node-pty) so stream-json flushes
 
-**Date:** February 2026
+**Commit:** `b05b478`
 
 The docs state that `--output-format stream-json` is intended for pipe and programmatic use (e.g. "works seamlessly with Unix pipes"). In practice, when the bridge spawned `claude` with `stdio: ['pipe', 'pipe', 'pipe']`, the CLI did not flush stdout — the bridge received no data until the process exited, so the UI showed "Running" but no output. This matches reported behavior in anthropics/claude-code#12965 and related issues: output is buffered when stdout is not a TTY. The suggested fix there was to make the CLI stream when stdout is a pipe; until that is fixed upstream, we spawn `claude` under a pseudo-TTY (via `node-pty`) so the process sees a TTY and uses line-buffered stdout. No CLI flag or documented env var was found to force unbuffered output. The bridge now uses `pty.spawn()` for the claude process only; caffeinate and all other logic are unchanged. Kill path and `killAllSessions` support both PTY (`.kill()`) and legacy ChildProcess (`process.kill(-pid)`).
 
@@ -699,11 +699,89 @@ The docs state that `--output-format stream-json` is intended for pipe and progr
 
 ### PTY spawn failure: spawn-helper not executable + diagnostics
 
-**Date:** February 2026
+**Commit:** `b05b478`
 
 On macOS, node-pty does not exec the target directly; it spawns a **spawn-helper** binary (under `prebuilds/darwin-*/spawn-helper`) which then execs the real process. Diagnostics showed `ptyHelperMode: "100644"` and `ptyHelperExecutable: false` — the helper had no execute bit, so `posix_spawn` failed with "posix_spawnp failed." Some npm installs or prebuild packs ship the helper with mode 0644. **Fix:** Before the first PTY spawn attempt, the bridge calls `ensurePtyHelperExecutable()`: on darwin it stat's the helper and, if it exists but is not executable, does `chmod(helperPath, 0o755)` and logs one line. No restart required for that fix to take effect for the next spawn; after any other bridge code or config change, run **`npm run reload`** (or `./bin/reload`) so the bridge and UI restart with the new code.
 
 **Observability:** When PTY spawn fails, the bridge logs a `ptySpawnDiagnostics` object (claude path/stat/shebang, `claudeSpawnSyncOk`, spawn-helper path and executable bit, process uid/gid, cwd). That made the 0644 helper the obvious cause.
+
+---
+
+### Ops: pm2-managed tailscale serve, `bin/dev` launcher, PATH/interpreter fixes
+
+**Commit:** `9f4b0ba`
+
+Several operational improvements to make the dev/production workflow more robust:
+
+**`bin/dev`** — New launcher script. Starts (or restarts) all pm2 apps via `ecosystem.config.js`, then streams logs. `Ctrl+C` exits the log tail; services keep running. Companion scripts: `npm run stop`, `npm run status`, `npm run logs`.
+
+**`bin/tailscale-serve`** — Foreground wrapper (`exec tailscale serve --https=7000 http://localhost:17000`) managed by pm2 as `remotedev-tailscale-serve`. Previously `tailscale serve --bg` was run once by `bin/setup` as a persistent background rule. The new approach lets pm2 own the lifecycle: stop/restart/delete all work. `bin/setup` was reworked to clear any leftover persistent `--bg` rules from previous setups.
+
+**`ecosystem.config.js` PATH fix** — pm2 daemon often runs with a stripped `PATH` (whatever was in scope when `pm2 startup` installed the launchd plist). This caused `claude` to not be found at spawn time. Fix: prepend `$HOME/.local/bin` to `PATH` in the bridge's env block.
+
+**`BRIDGE_NODE` interpreter pin** — `ecosystem.config.js` now sets `interpreter: process.env.BRIDGE_NODE || 'node'`. This ensures pm2 uses the same Node version the native addons (`better-sqlite3`, `node-pty`, `re2`) were compiled for, regardless of which Node the pm2 daemon was started with.
+
+**`bin/reload`** — Added `export NODE_ENV=production` so the bridge picks up the correct environment on restart.
+
+---
+
+### Security: Move secrets from build-time `NEXT_PUBLIC_*` to runtime `/api/token`
+
+**Commit:** `72a6f23`
+
+**Problem:** `NEXT_PUBLIC_BRIDGE_WS_URL`, `NEXT_PUBLIC_CLIENT_SECRET`, and `NEXT_PUBLIC_WORKING_DIR` were baked into the Next.js client bundle at build time. Rotating secrets required a full `npm run build`. Worse, `NEXT_PUBLIC_CLIENT_SECRET` was visible in the browser's JS source — not a direct vulnerability (it's only used for HMAC assertion), but unnecessary exposure.
+
+**Fix:** All three are now server-side env vars (`BRIDGE_WS_URL`, `REMOTEDEV_CLIENT_SECRET`, `ALLOWED_ROOTS`) read only by the `/api/token` route, which returns them alongside the HMAC assertion at runtime. The client fetches config on mount. No rebuild needed when secrets rotate — just `npm run reload`.
+
+**Files:** `ui/app/api/token/route.ts`, `ui/hooks/useWebSocket.ts`, `ecosystem.config.js` (env renames).
+
+---
+
+### Feature: Project picker for multiple `ALLOWED_ROOTS`
+
+**Commit:** `08dcf5d`
+
+When `ALLOWED_ROOTS` contains multiple colon-separated directories (e.g. `~/Code:~/Projects`), the UI now shows a project picker before creating a session. The user taps one of the roots, and `create_session` is sent with that directory as `workingDir`. When there's only one root (or none), the picker is skipped and sessions auto-create on authentication as before.
+
+**State changes:** Added `CLEAR_SESSION` reducer action (resets sessionId, state, and messages) and a "New Session" button in the header for starting fresh.
+
+---
+
+### Feature: iPhone safe-area support
+
+**Commit:** `08dcf5d`
+
+The UI now renders edge-to-edge on iPhone (including under the Dynamic Island / notch and home indicator):
+
+- `layout.tsx`: Added `viewport-fit: cover` via Next.js `Viewport` export.
+- `globals.css`: Added `.pt-safe` / `.pb-safe` utility classes using `env(safe-area-inset-top)` / `env(safe-area-inset-bottom)`.
+- `page.tsx`: Header uses `pt-safe`, input area uses `pb-safe` with a `max()` fallback for devices without safe areas.
+
+---
+
+### Fix: Assistant message parsing in `ChatMessage.tsx`
+
+**Commit:** `08dcf5d`
+
+**Bug:** `payloadToText` looked for `payload.content` on `assistant` type messages, but Claude's stream-json wraps content under `payload.message.content`. The UI showed nothing for assistant messages.
+
+**Fix:** Read `content` from `payload.message.content`. Also added rendering for `tool_use` blocks: they now display as `[tool_name]` followed by the JSON input, so the user can see what tools Claude is invoking.
+
+---
+
+### Chore: Logger always uses pino-pretty
+
+**Commit:** `b05b478`
+
+Previously `bridge-server/logger.js` only used `pino-pretty` when `NODE_ENV !== 'production'`. Since all bridge logs are read by humans (pm2 log files or `pm2 logs` terminal), pretty-printing is always useful. Changed to unconditionally use `pino-pretty` with compact timestamps (`HH:MM:ss`) and suppressed `pid`/`hostname` fields. Moved `pino-pretty` from `devDependencies` to `dependencies` in `bridge-server/package.json`.
+
+---
+
+### Chore: `getClaudePath()` for absolute-path spawning
+
+**Commit:** `b05b478`
+
+Added `getClaudePath()` to `startup-checks.js` (exported). Returns `process.env.CLAUDE_PATH` if set, otherwise `$HOME/.local/bin/claude`. Used by both `checkClaudeVersion()` and `session.js` spawn. This avoids relying on `PATH` resolution at spawn time, which is fragile under pm2 where the daemon PATH may differ from the user's shell.
 
 ---
 
