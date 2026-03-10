@@ -245,6 +245,14 @@ function getSessionRow(id) {
   ).get(id);
 }
 
+/** Check if branch is leased by another ACTIVE/RUNNING chat in the same project (exclude chatId). */
+function isBranchLeasedByOther(projectPath, currentBranch, excludeChatId) {
+  const row = db.prepare(
+    `SELECT id FROM sessions WHERE project_path = ? AND current_branch = ? AND chat_status IN ('ACTIVE', 'RUNNING') AND id != ? LIMIT 1`
+  ).get(projectPath, currentBranch, excludeChatId || '');
+  return row != null;
+}
+
 function insertTranscriptBatch(rows) {
   const insert = db.prepare(
     `INSERT INTO transcript (session_id, seq, root_message_id, type, data, ts)
@@ -328,6 +336,7 @@ module.exports = {
   listProjects,
   listChatsByProject,
   getSessionRow,
+  isBranchLeasedByOther,
   insertTranscriptBatch,
   getTranscriptTail,
   countRawStdoutLines,
