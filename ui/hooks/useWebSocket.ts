@@ -57,6 +57,9 @@ export function useWebSocket({
   const epochRef = useRef<string | null>(controllerEpoch);
   const sessionIdRef = useRef<string | null>(sessionId || null);
   const lastAckRef = useRef(0);
+  // Stable ref so onMessage changes never cause connect() to be recreated,
+  // which would tear down and rebuild the WebSocket unnecessarily.
+  const onMessageRef = useRef(onMessage);
 
   useEffect(() => {
     epochRef.current = controllerEpoch;
@@ -65,6 +68,10 @@ export function useWebSocket({
   useEffect(() => {
     sessionIdRef.current = sessionId || null;
   }, [sessionId]);
+
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
 
   const fetchToken = useCallback(async (): Promise<{
     wsAuth: string;
@@ -161,7 +168,7 @@ export function useWebSocket({
         lastAckRef.current = msg.payload.seq as number;
       }
 
-      onMessage?.(msg);
+      onMessageRef.current?.(msg);
     };
 
     ws.onclose = (event) => {
@@ -210,7 +217,7 @@ export function useWebSocket({
     ws.onerror = () => {
       // onerror is always followed by onclose; handle there
     };
-  }, [fetchToken, onMessage]);
+  }, [fetchToken]);
 
   const scheduleReconnect = useCallback((ms: number) => {
     if (destroyedRef.current) return;

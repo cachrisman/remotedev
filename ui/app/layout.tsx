@@ -16,14 +16,21 @@ export const viewport: Viewport = {
   viewportFit: 'cover',
 };
 
+// Anti-flash: set `dark` class synchronously before first paint so Tailwind
+// picks the right colour scheme without a visible flicker.
+// Default is dark; light is opt-in via the in-app toggle.
+const themeScript = `(function(){try{var t=localStorage.getItem('theme');if(t==='light'){document.documentElement.classList.remove('dark')}else{document.documentElement.classList.add('dark')}}catch(e){}})()`;
+
 export default function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body className="bg-gray-950 text-gray-100">
+    <html lang="en" suppressHydrationWarning>
+      {/* eslint-disable-next-line @next/next/no-sync-scripts */}
+      <head><script dangerouslySetInnerHTML={{ __html: themeScript }} /></head>
+      <body className="bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100">
         {children}
       </body>
     </html>

@@ -193,9 +193,19 @@ function handleConnection(ws, req) {
     }
 
     // Route message
-    routeMessage(ws, ip, msg, () => {
-      sessionId = msg.sessionId || sessionId;
+    routeMessage(ws, ip, msg, (newSessionId) => {
+      // newSessionId is set by create_session (server-assigned UUID).
+      // Also pick up sessionId from any message that includes it so the
+      // ws.on('close') handler can find and disconnect the right session.
+      sessionId = newSessionId || msg.sessionId || sessionId;
     });
+
+    // Keep sessionId current from client-supplied field on every message.
+    // create_session responses assign a new ID via the onSession callback above;
+    // all other mutating messages carry the existing sessionId on the message itself.
+    if (msg.sessionId) {
+      sessionId = msg.sessionId;
+    }
   });
 
   ws.on('close', (code, reason) => {
@@ -267,7 +277,7 @@ function handleAuthenticate(ws, ip, msg, cb) {
   cb(true, epoch);
 }
 
-function routeMessage(ws, ip, msg, onSession) {
+function routeMessage(ws, ip, msg, onSession /* (newSessionId?: string) => void */) {
   const { type, payload, sessionId } = msg;
 
   switch (type) {
@@ -294,7 +304,7 @@ function routeMessage(ws, ip, msg, onSession) {
       session._resetHeartbeatTimer();
 
       db.insertAuditLog(id, null, 'session_created', { name, workingDir });
-      onSession();
+      onSession(id);
 
       sendMsg(ws, buildMsg('state_sync', id, {
         state: 'IDLE', sessionId: id, seq: 0, lastAck: 0,

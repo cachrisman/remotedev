@@ -11,17 +11,18 @@ Detailed operational reference for RemoteDev v0.16. For the quick-start, see the
 3. [Starting the Servers](#starting-the-servers)
 4. [Connecting from iPhone](#connecting-from-iphone)
 5. [Sending Instructions](#sending-instructions)
-6. [Session States](#session-states)
-7. [Approving Tool Calls](#approving-tool-calls)
-8. [Reconnecting After Drops](#reconnecting-after-drops)
-9. [Restarting the Bridge](#restarting-the-bridge-binreload)
-10. [Viewing Logs](#viewing-logs)
-11. [Rotating the Client Secret](#rotating-the-client-secret)
-12. [TLS Certificate Renewal](#tls-certificate-renewal)
-13. [Warning Banners](#warning-banners)
-14. [Troubleshooting](#troubleshooting)
-15. [Security Notes](#security-notes)
-16. [Database](#database)
+6. [Project Picker](#project-picker)
+7. [Session States](#session-states)
+8. [Approving Tool Calls](#approving-tool-calls)
+9. [Reconnecting After Drops](#reconnecting-after-drops)
+10. [Restarting the Bridge](#restarting-the-bridge-binreload)
+11. [Viewing Logs](#viewing-logs)
+12. [Rotating the Client Secret](#rotating-the-client-secret)
+13. [TLS Certificate Renewal](#tls-certificate-renewal)
+14. [Warning Banners](#warning-banners)
+15. [Troubleshooting](#troubleshooting)
+16. [Security Notes](#security-notes)
+17. [Database](#database)
 
 ---
 
@@ -153,13 +154,23 @@ pm2 save   # persist across reboots
 pm2 startup  # configure pm2 to start on login (follow the instructions it prints)
 ```
 
-### Verify both processes are running
+This starts three processes:
+
+| pm2 name | Role | Port |
+|---|---|---|
+| `remotedev-bridge` | WebSocket bridge server | 7001 (direct WSS) |
+| `remotedev-ui` | Next.js UI server (internal) | 7000 (localhost only) |
+| `remotedev-tailscale-serve` | `tailscale serve` HTTPS reverse proxy | 443 / tailnet HTTPS |
+
+The UI is **not** served directly on port 7000 to your iPhone. Instead, `tailscale serve` acts as a TLS-terminating reverse proxy and forwards requests from `https://mac.tail1234.ts.net` → `http://localhost:7000`. This means your iPhone connects to port 443 (standard HTTPS), not a custom port.
+
+### Verify all three processes are running
 
 ```bash
 pm2 status
 ```
 
-You should see `remotedev-bridge` and `remotedev-ui` both online.
+You should see `remotedev-bridge`, `remotedev-ui`, and `remotedev-tailscale-serve` all online.
 
 ### Check the bridge started cleanly
 
@@ -168,7 +179,6 @@ pm2 logs remotedev-bridge --lines 20
 ```
 
 Look for:
-- `TLS enabled` (if TLS cert found)
 - `Allowed roots resolved`
 - `SQLite opened`
 - `Bridge server listening` on port 7001
@@ -178,11 +188,13 @@ Look for:
 ## Connecting from iPhone
 
 1. Open Safari on iPhone
-2. Navigate to `https://mac.tail1234.ts.net:7000` (your tailnet hostname)
+2. Navigate to `https://mac.tail1234.ts.net` (your tailnet hostname — **no port number**)
 3. Safari should connect without a certificate warning (if it does warn, re-run `tailscale cert`)
 4. The connection indicator in the top-left should turn **green** within a few seconds
 
 If prompted for the client secret, use the password Safari saved in Step 6 of setup.
+
+> **iPhone safe areas:** The UI automatically insets its content for the notch, Dynamic Island, and home indicator using CSS `env(safe-area-inset-*)`. No special setup is needed; it just works in Safari.
 
 ---
 
@@ -198,6 +210,28 @@ Once connected (green indicator, "Ready" status):
 3. Tap **Send** (or press Return on a keyboard)
 
 The UI sends the instruction to the bridge, which spawns a `claude -p` process in your configured working directory. Output streams back in real time.
+
+> **Note:** The Send button and text area are disabled while the WebSocket is connecting or authenticating. Wait for the green indicator before typing your instruction.
+
+---
+
+## Project Picker
+
+If your `ALLOWED_ROOTS` contains **more than one directory**, the UI shows a project picker before creating a session. Tap the directory you want to work in, and the session is created with that directory as the working directory for `claude`.
+
+```
+┌─────────────────────────────────┐
+│  Select a project               │
+│                                 │
+│  > /Users/you/projects/web-app  │
+│    /Users/you/projects/api      │
+│    /Users/you/work/client-x     │
+└─────────────────────────────────┘
+```
+
+If `ALLOWED_ROOTS` has only one directory, the picker is skipped and the session starts immediately.
+
+To switch projects, end the current session and reload the page — the picker will appear again on the next connection.
 
 ---
 
@@ -440,6 +474,32 @@ The orphan scanner runs every 5 minutes and will kill any `claude` processes wit
 # Manual orphan scan (view only — don't pipe to kill without reviewing)
 ps -eo pid,etime,command | grep 'claude.*stream-json'
 ```
+
+### No output from Claude — PTY spawn failed
+
+If the bridge logs contain `ptySpawnDiagnostics` with `ptyHelperExecutable: false`, the node-pty spawn-helper binary is missing its execute bit:
+
+```bash
+# Rebuild node-pty (sets the execute bit on spawn-helper)
+cd bridge-server && npm install && cd ..
+
+# Restart the bridge to pick up the fix
+./bin/reload
+```
+
+You should see `Set node-pty spawn-helper executable` in the logs on the next start.
+
+If you're on Linux, node-pty doesn't use a spawn-helper. Check that `LD_LIBRARY_PATH` and glibc compatibility are correct for your distribution.
+
+### First instruction from iPhone is ignored
+
+The UI disables the Send button while the WebSocket is connecting. If you submit an instruction very quickly after the page loads (before the green indicator appears), it may be queued while the connection is still establishing. Wait for the green indicator, then send.
+
+### Approval modal never appears (tools run without asking)
+
+This would indicate a misconfiguration in the approval flow. The bridge is designed to intercept every tool call and require explicit approval. Check that:
+- You're on the latest bridge version (`./bin/reload` after a `git pull`)
+- The bridge log shows `approval_requested` events for tool calls
 
 ---
 

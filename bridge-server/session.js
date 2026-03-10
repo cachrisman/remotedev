@@ -199,6 +199,10 @@ class Session {
     // rootMessageId for current input
     this.rootMessageId = null;
 
+    // Track PTY process exit separately — node-pty IDisposable does not expose
+    // .exitCode / .signalCode / .killed, so we need our own flag.
+    this._ptyExited = false;
+
     // Resolved path variables (set at create time)
     this.resolvedRoots = [];
     this.resolvedWorkingDir = null;
@@ -269,10 +273,13 @@ class Session {
 
     this.ws = newWs;
 
-    const procAlive = this.proc &&
-      this.proc.exitCode === null &&
-      this.proc.signalCode === null &&
-      !this.proc.killed;
+    // node-pty IDisposable does not expose .exitCode/.signalCode/.killed;
+    // use the _ptyExited flag set in the onExit handler instead.
+    const procAlive = this.proc && (
+      this._isPty
+        ? !this._ptyExited
+        : (this.proc.exitCode === null && this.proc.signalCode === null && !this.proc.killed)
+    );
 
     // Restore from preDisconnectState
     if (this.preDisconnectState === 'AWAITING_APPROVAL' && this.pendingApproval) {
@@ -326,12 +333,23 @@ class Session {
       CI: 'true',
       NONINTERACTIVE: '1',
       REMOTEDEV_SESSION_ID: this.id,
+      // Disable ANSI color codes and terminal control sequences so that
+      // PTY output is clean NDJSON. Without these, color codes can be
+      // interleaved with JSON, causing parse errors.
+      NO_COLOR: '1',
+      TERM: 'dumb',
     };
 
     // PTY first (when available): stream-json is documented for pipe use but the CLI buffers when stdout is not a TTY.
     // If PTY fails once (e.g. posix_spawnp under pm2), we set ptyUnavailable and use pipe only for the rest of this process.
     const claudePath = getClaudePath();
-    const spawnArgs = ['-p', '--output-format', 'stream-json', '--verbose', '--allowedTools', 'all', instruction];
+    // --verbose is intentionally omitted: in PTY mode stderr is merged with stdout,
+    // so verbose/debug lines would corrupt the NDJSON stream and trigger parse errors.
+    // --allowedTools is intentionally omitted: without an allowlist every tool call
+    // requires stdin approval — which is exactly what the bridge provides via its
+    // AWAITING_APPROVAL FSM state. Passing '--allowedTools all' would auto-approve
+    // every tool and bypass the approval modal entirely.
+    const spawnArgs = ['-p', '--output-format', 'stream-json', instruction];
     const spawnOpts = { cwd: this.resolvedWorkingDir || this.workingDir, env };
     let proc;
     let isPty = false;
@@ -398,6 +416,7 @@ class Session {
       });
       this.proc.onExit(({ exitCode, signal }) => {
         if (this.destroyed) return;
+        this._ptyExited = true;
         logger.info({ sessionId: this.id, code: exitCode, signal }, 'Claude process closed');
         this._framer.flush();
         this.endSession(`proc_exit:${exitCode ?? signal ?? 'unknown'}`);
@@ -556,13 +575,21 @@ class Session {
   _emitControlResponse(requestId, decision) {
     if (this.destroyed) return;
 
-    // Send to subprocess stdin (pty.write for node-pty, .stdin.write for child_process)
+    // Send tool_result to subprocess stdin so Claude Code CLI continues execution.
+    // Claude's --output-format stream-json mode expects a JSON array containing a
+    // tool_result message on stdin after each tool_use event. An empty content
+    // string means "approved, proceed"; is_error:true with a reason string means
+    // "denied, do not execute".
     if (!this.proc) return;
+    const toolResult = decision === 'approve'
+      ? [{ type: 'tool_result', tool_use_id: requestId, content: '' }]
+      : [{ type: 'tool_result', tool_use_id: requestId, content: 'User denied this action.', is_error: true }];
+    const msg = JSON.stringify(toolResult) + '\n';
     try {
       if (this._isPty) {
-        this.proc.write(JSON.stringify({ type: 'control_response', requestId, decision }) + '\n');
+        this.proc.write(msg);
       } else if (this.proc.stdin && this.proc.stdin.writable) {
-        this.proc.stdin.write(JSON.stringify({ type: 'control_response', requestId, decision }) + '\n');
+        this.proc.stdin.write(msg);
       }
     } catch {}
 
