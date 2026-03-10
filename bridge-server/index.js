@@ -16,6 +16,7 @@ const { resolveAllowedRoots, validateProjectPath } = require('./path-validator')
 const gitHelper = require('./git');
 const { runStartupChecks } = require('./startup-checks');
 const { startOrphanScan } = require('./orphan-scan');
+const { startIdleCheckInterval } = require('./idle-checkpoint');
 
 // ──────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -787,6 +788,7 @@ async function main() {
 
   // DB
   db.openDb();
+  startIdleCheckInterval();
 
   const dbDir = path.join(process.env.HOME || '/tmp', '.local', 'share', 'remotedev');
   runStartupChecks({

@@ -373,6 +373,8 @@ class Session {
     this._isPty = isPty;
     this.state = 'RUNNING';
     db.updateSessionState(this.id, 'RUNNING');
+    const now = Date.now();
+    db.updateSessionChatFields(this.id, { last_activity_at: now, chat_status: 'RUNNING' });
     db.insertAuditLog(this.id, this.rootMessageId, 'session_start', {
       instruction: instruction.slice(0, 500),
     });
@@ -571,6 +573,13 @@ class Session {
     this.pendingApproval = null;
     this.state = this.proc ? 'RUNNING' : 'IDLE';
     db.updateSessionState(this.id, this.state);
+    db.updateSessionChatFields(this.id, { last_activity_at: Date.now() });
+    if (this.state === 'IDLE') {
+      const row = db.getSessionRow(this.id);
+      if (row && row.chat_status !== 'PAUSED' && row.chat_status !== 'ARCHIVED') {
+        db.updateSessionChatFields(this.id, { chat_status: 'ACTIVE' });
+      }
+    }
     db.insertAuditLog(this.id, this.rootMessageId, 'approval_resolved', {
       requestId, decision,
     });
@@ -886,8 +895,12 @@ class Session {
       this._send(this._buildEnvelope({ type: 'exit', payload: { reason } }));
     }
 
-    // 8. State + SessionManager cleanup
+    // 8. When agent work ends, set chat_status = ACTIVE (unless PAUSED/ARCHIVED)
     this.state = 'IDLE';
+    const row = db.getSessionRow(this.id);
+    if (row && row.chat_status !== 'PAUSED' && row.chat_status !== 'ARCHIVED') {
+      db.updateSessionChatFields(this.id, { chat_status: 'ACTIVE' });
+    }
     sessionManager.remove(this.id);
     sessionManager.releaseController(this.id);
 
