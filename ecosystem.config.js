@@ -22,11 +22,27 @@ const allowedRoots = process.env.ALLOWED_ROOTS || process.env.HOME;
 module.exports = {
   apps: [
     {
+      name: 'remotedev-tailscale-serve',
+      script: './bin/tailscale-serve',
+      interpreter: '/bin/zsh',
+      cwd: __dirname,
+      autorestart: true,
+      max_restarts: 5,
+      restart_delay: 2000,
+    },
+    {
       name: 'remotedev-bridge',
       script: './bridge-server/index.js',
+      // Pin to the node binary set by BRIDGE_NODE env var (written by bin/setup
+      // or set manually), falling back to whatever 'node' is in PATH.
+      // This ensures pm2 uses the same node version the native addons were
+      // compiled for, regardless of which node the pm2 daemon was started with.
+      interpreter: process.env.BRIDGE_NODE || 'node',
       cwd: __dirname,
       wait_ready: true,
       listen_timeout: 10000,
+      out_file: `${__dirname}/logs/bridge-out.log`,
+      error_file: `${__dirname}/logs/bridge-err.log`,
       env: {
         NODE_ENV: 'production',
         BRIDGE_PORT: '7001',
@@ -37,6 +53,9 @@ module.exports = {
         TLS_KEY: process.env.TLS_KEY || `/var/lib/tailscale/certs/${host}.key`,
         CLAUDE_MIN_VERSION: process.env.CLAUDE_MIN_VERSION || '0.0.0',
         LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+        // Ensure claude and other user-installed tools are on PATH regardless of
+        // how pm2 was launched (pm2 daemon often runs with a stripped PATH).
+        PATH: `${process.env.HOME}/.local/bin:${process.env.PATH || '/usr/local/bin:/usr/bin:/bin'}`,
       },
     },
     {
@@ -46,12 +65,14 @@ module.exports = {
       args: 'start --port 17000 --hostname 127.0.0.1',
       cwd: `${__dirname}/ui`,
       wait_ready: false,
+      out_file: `${__dirname}/logs/ui-out.log`,
+      error_file: `${__dirname}/logs/ui-err.log`,
       env: {
         NODE_ENV: 'production',
         BRIDGE_AUTH_TOKEN: bridgeAuthToken,
-        NEXT_PUBLIC_BRIDGE_WS_URL: `wss://${host}:7001`,
-        NEXT_PUBLIC_CLIENT_SECRET: clientSecret,
-        NEXT_PUBLIC_WORKING_DIR: allowedRoots?.split(':')[0] || process.env.HOME,
+        BRIDGE_WS_URL: `wss://${host}:7001`,
+        REMOTEDEV_CLIENT_SECRET: clientSecret,
+        ALLOWED_ROOTS: allowedRoots,
         UI_BUILD_VERSION: Date.now().toString(),
       },
     },

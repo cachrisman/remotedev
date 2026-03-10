@@ -20,6 +20,7 @@ done
 echo "→ Generating new BRIDGE_AUTH_TOKEN..."
 NEW_TOKEN=$(openssl rand -hex 32)
 export BRIDGE_AUTH_TOKEN="$NEW_TOKEN"
+export NODE_ENV=production
 
 echo "→ Restarting remotedev-bridge with updated env..."
 pm2 restart remotedev-bridge --update-env

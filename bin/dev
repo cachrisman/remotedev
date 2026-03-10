@@ -1,0 +1,25 @@
+#!/usr/bin/env zsh
+# bin/dev — Start (or restart) all pm2 apps, then stream logs.
+#
+# Ctrl+C exits the log stream; services keep running in the background.
+# Use 'npm run stop' to shut everything down.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if pm2 pid remotedev-bridge &>/dev/null 2>&1; then
+  echo "→ Services already running — restarting with updated env..."
+  pm2 restart ecosystem.config.js --update-env
+else
+  echo "→ Starting RemoteDev services..."
+  pm2 start ecosystem.config.js
+fi
+
+echo ""
+echo "  Ctrl+C    stop watching logs (services keep running)"
+echo "  npm run stop    stop all services"
+echo "  npm run reload  rotate auth token + restart"
+echo "  npm run status  show process table"
+echo ""
+
+pm2 logs

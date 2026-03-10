@@ -52,18 +52,21 @@ fi
 # Step 3: tailscale serve (HTTPS reverse proxy for the UI on port 7000)
 bold ""
 bold "Step 3: Tailscale HTTPS proxy"
+echo "  tailscale serve is managed by pm2 as 'remotedev-tailscale-serve'."
+echo "  It starts and stops automatically with: npm run dev"
+echo ""
 if command -v tailscale &>/dev/null; then
-  # Configure tailscale serve to proxy external HTTPS:7000 → local HTTP:17000.
-  # This is idempotent — safe to re-run.
-  if tailscale serve --bg --https=7000 http://localhost:17000 2>/dev/null; then
-    green "  ✓ tailscale serve configured: https://${TAILNET_HOST}:7000 → http://localhost:17000"
+  # Clear any persistent --bg serve rule on port 7000 left from a previous setup.
+  if tailscale serve status 2>/dev/null | grep -q "7000"; then
+    echo "  Clearing existing persistent serve rule on port 7000..."
+    if tailscale serve --https=7000 off 2>/dev/null; then
+      green "  ✓ Cleared (pm2 will manage it going forward)"
+    else
+      yellow "  ⚠ Could not clear automatically — run: tailscale serve --https=7000 off"
+    fi
   else
-    yellow "  ⚠ Could not configure tailscale serve automatically."
-    yellow "    Run manually: tailscale serve --bg --https=7000 http://localhost:17000"
+    green "  ✓ No persistent serve rule found — nothing to clear"
   fi
-else
-  yellow "  ⚠ Tailscale not found — skipping. Run manually once Tailscale is installed:"
-  yellow "    tailscale serve --bg --https=7000 http://localhost:17000"
 fi
 
 # ──────────────────────────────────────────────────────────────────────────
