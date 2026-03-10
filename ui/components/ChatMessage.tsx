@@ -57,9 +57,10 @@ export function payloadToText(payload: Record<string, unknown>): string | null {
     return JSON.stringify(result, null, 2);
   }
 
-  // Stream-JSON assistant message
+  // Stream-JSON assistant message: { type: "assistant", message: { content: [...] }, ... }
   if (payload.type === 'assistant') {
-    const content = payload.content as unknown[];
+    const msg = payload.message as Record<string, unknown> | undefined;
+    const content = msg?.content as unknown[];
     if (!Array.isArray(content)) return null;
     const texts: string[] = [];
     for (const block of content) {
@@ -67,10 +68,14 @@ export function payloadToText(payload: Record<string, unknown>): string | null {
         const b = block as Record<string, unknown>;
         if (b.type === 'text' && typeof b.text === 'string') {
           texts.push(b.text);
+        } else if (b.type === 'tool_use') {
+          const name = b.name as string;
+          const input = b.input ? JSON.stringify(b.input, null, 2) : '';
+          texts.push(`[${name}]\n${input}`);
         }
       }
     }
-    return texts.join('') || null;
+    return texts.join('\n') || null;
   }
 
   return null;
