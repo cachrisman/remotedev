@@ -2,6 +2,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 
 let RE2;
 try {
@@ -107,4 +108,52 @@ function resolveAllowedRoots(roots) {
   });
 }
 
-module.exports = { validatePath, resolveAllowedRoots, safeMatch };
+/**
+ * Validate a path for add_project: must be an existing directory, under allowed roots, and a git repo.
+ * No ancestor walk — the exact path must exist.
+ * @param {string} rawPath - User-supplied path (absolute or relative to cwd)
+ * @param {string[]} resolvedRoots - Already-realpathSync'd allowed roots
+ * @returns {{ safe: boolean, resolvedPath?: string, error?: 'PATH_NOT_FOUND'|'NOT_WITHIN_ALLOWED_ROOTS'|'NOT_A_GIT_REPO' }}
+ */
+function validateProjectPath(rawPath, resolvedRoots) {
+  if (!rawPath || typeof rawPath !== 'string') {
+    return { safe: false, error: 'PATH_NOT_FOUND' };
+  }
+  const normalized = path.normalize(rawPath);
+  const absolute = path.isAbsolute(normalized) ? normalized : path.resolve(process.cwd(), normalized);
+  let stat;
+  try {
+    stat = fs.statSync(absolute);
+  } catch (e) {
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') {
+      return { safe: false, error: 'PATH_NOT_FOUND' };
+    }
+    return { safe: false, error: 'PATH_NOT_FOUND' };
+  }
+  if (!stat.isDirectory()) {
+    return { safe: false, error: 'PATH_NOT_FOUND' };
+  }
+  let resolvedPath;
+  try {
+    resolvedPath = fs.realpathSync(absolute);
+  } catch (e) {
+    return { safe: false, error: 'PATH_NOT_FOUND' };
+  }
+  const allowed = resolvedRoots.some(root =>
+    resolvedPath === root || resolvedPath.startsWith(root + path.sep)
+  );
+  if (!allowed) {
+    return { safe: false, error: 'NOT_WITHIN_ALLOWED_ROOTS' };
+  }
+  const gitResult = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], {
+    cwd: resolvedPath,
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  if (gitResult.status !== 0 || (gitResult.stdout || '').trim() !== 'true') {
+    return { safe: false, error: 'NOT_A_GIT_REPO' };
+  }
+  return { safe: true, resolvedPath };
+}
+
+module.exports = { validatePath, validateProjectPath, resolveAllowedRoots, safeMatch };
