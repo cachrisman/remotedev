@@ -142,7 +142,7 @@ function ensurePtyHelperExecutable() {
 ensurePtyHelperExecutable();
 
 class Session {
-  constructor(id, name, workingDir) {
+  constructor(id, name, workingDir, opts = {}) {
     this.id = id;
     this.name = name;
     this.workingDir = workingDir;
@@ -206,7 +206,9 @@ class Session {
     // Client error count per session
     this.clientErrorCount = 0;
 
-    db.insertSession(id, name, workingDir);
+    if (!opts.skipDbInsert) {
+      db.insertSession(id, name, workingDir);
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
