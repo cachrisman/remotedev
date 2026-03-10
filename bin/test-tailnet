@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+# bin/test-tailnet — Tailnet integration test suite.
+#
+# Must pass before merging changes to: reconnect, approval FSM, path validation.
+#
+# Prerequisites:
+#   - TAILNET_HOST set (e.g., mac.tailnet-name.ts.net)
+#   - BRIDGE_AUTH_TOKEN set
+#   - REMOTEDEV_CLIENT_SECRET set
+#   - Bridge running on $TAILNET_HOST:7001
+#   - Next.js running on $TAILNET_HOST:7000
+#
+# Usage:
+#   ./bin/test-tailnet [--skip-manual]
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+TAILNET_HOST="${TAILNET_HOST:-localhost}"
+BRIDGE_PORT="${BRIDGE_PORT:-7001}"
+UI_PORT="${UI_PORT:-7000}"
+BRIDGE_AUTH_TOKEN="${BRIDGE_AUTH_TOKEN:-}"
+CLIENT_SECRET="${REMOTEDEV_CLIENT_SECRET:-}"
+SKIP_MANUAL="${1:-}"
+
+PASS=0
+FAIL=0
+SKIP=0
+
+green() { echo -e "\033[32m$*\033[0m"; }
+red()   { echo -e "\033[31m$*\033[0m"; }
+yellow(){ echo -e "\033[33m$*\033[0m"; }
+
+pass() { PASS=$((PASS+1)); green "  ✓ $*"; }
+fail() { FAIL=$((FAIL+1)); red   "  ✗ $*"; }
+skip() { SKIP=$((SKIP+1)); yellow "  ○ $*"; }
+
+require_var() {
+  if [ -z "${!1:-}" ]; then
+    echo "Error: $1 is required" >&2
+    exit 1
+  fi
+}
+
+require_var BRIDGE_AUTH_TOKEN
+require_var CLIENT_SECRET
+
+BRIDGE_URL="wss://${TAILNET_HOST}:${BRIDGE_PORT}"
+UI_URL="https://${TAILNET_HOST}:${UI_PORT}"
+
+echo ""
+echo "RemoteDev Tailnet Test Suite"
+echo "Bridge: $BRIDGE_URL"
+echo "UI:     $UI_URL"
+echo ""
+
+# ──────────────────────────────────────────────────────────────────────────
+# Helper: compute HMAC
+compute_hmac() {
+  local token="$1"
+  local data="$2"
+  echo -n "$data" | openssl dgst -sha256 -hmac "$token" | awk '{print $2}'
+}
+
+# Helper: fetch wsAuth from /api/token
+fetch_token() {
+  curl -sk "${UI_URL}/api/token"
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# Test: WSS connectivity
+echo "=== Connectivity ==="
+if nc -z "$TAILNET_HOST" "$BRIDGE_PORT" 2>/dev/null; then
+  pass "Bridge port $BRIDGE_PORT reachable"
+else
+  fail "Bridge port $BRIDGE_PORT not reachable"
+fi
+
+if nc -z "$TAILNET_HOST" "$UI_PORT" 2>/dev/null; then
+  pass "UI port $UI_PORT reachable"
+else
+  fail "UI port $UI_PORT not reachable"
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
+# Test: /api/token returns proper fields
+echo ""
+echo "=== HMAC Assertion ==="
+TOKEN_JSON=$(fetch_token 2>/dev/null || echo '{}')
+WS_AUTH=$(echo "$TOKEN_JSON" | jq -r '.wsAuth // empty')
+NONCE=$(echo "$TOKEN_JSON" | jq -r '.nonce // empty')
+TS=$(echo "$TOKEN_JSON" | jq -r '.ts // empty')
+
+if [ -n "$WS_AUTH" ] && [ -n "$NONCE" ] && [ -n "$TS" ]; then
+  pass "/api/token returns wsAuth, nonce, ts"
+else
+  fail "/api/token missing required fields (got: $TOKEN_JSON)"
+fi
+
+# Verify HMAC locally
+if [ -n "$WS_AUTH" ]; then
+  EXPECTED=$(compute_hmac "$BRIDGE_AUTH_TOKEN" "${NONCE}:${TS}")
+  if [ "$WS_AUTH" = "$EXPECTED" ]; then
+    pass "HMAC signature is valid"
+  else
+    fail "HMAC signature mismatch"
+  fi
+fi
+
+# Verify /api/token is force-dynamic (different nonce each call)
+TOKEN_JSON2=$(fetch_token 2>/dev/null || echo '{}')
+NONCE2=$(echo "$TOKEN_JSON2" | jq -r '.nonce // empty')
+if [ "$NONCE" != "$NONCE2" ] && [ -n "$NONCE" ] && [ -n "$NONCE2" ]; then
+  pass "/api/token is force-dynamic (unique nonce each request)"
+else
+  fail "/api/token returned same nonce twice (may be cached)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
+# Test: TLS cert validity
+echo ""
+echo "=== TLS Certificate ==="
+CERT_EXPIRY=$(echo | openssl s_client -connect "${TAILNET_HOST}:${BRIDGE_PORT}" \
+  -servername "$TAILNET_HOST" 2>/dev/null | \
+  openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+
+if [ -n "$CERT_EXPIRY" ]; then
+  EXPIRY_EPOCH=$(date -d "$CERT_EXPIRY" +%s 2>/dev/null || date -j -f "%b %e %H:%M:%S %Y %Z" "$CERT_EXPIRY" +%s 2>/dev/null || echo 0)
+  NOW_EPOCH=$(date +%s)
+  DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+
+  if [ "$DAYS_LEFT" -gt 1 ]; then
+    pass "TLS cert valid ($DAYS_LEFT days remaining)"
+  else
+    fail "TLS cert expires in <1 day ($DAYS_LEFT days)"
+  fi
+else
+  skip "Could not verify TLS cert (openssl unavailable?)"
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
+# Server restart token recovery test
+echo ""
+echo "=== Server Restart / Token Desync ==="
+if [ -x "./bin/reload" ] && command -v pm2 &>/dev/null; then
+  echo "  Running ./bin/reload and verifying token refresh..."
+  if ./bin/reload >/dev/null 2>&1; then
+    TOKEN_AFTER=$(fetch_token 2>/dev/null || echo '{}')
+    WS_AFTER=$(echo "$TOKEN_AFTER" | jq -r '.wsAuth // empty')
+    if [ -n "$WS_AFTER" ]; then
+      pass "Token refresh works after ./bin/reload"
+    else
+      fail "Token refresh failed after ./bin/reload"
+    fi
+  else
+    fail "./bin/reload failed"
+  fi
+else
+  skip "pm2 not available — skipping server restart test"
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
+# Manual tests (require iPhone)
+echo ""
+echo "=== Manual Tests (iPhone Required) ==="
+if [ "$SKIP_MANUAL" = "--skip-manual" ]; then
+  skip "WSS trust (iPhone Safari connects; no cert warning)"
+  skip "HMAC assertion end-to-end (authenticate → controllerEpoch on device)"
+  skip "Long task + disconnect (cellular drop + reconnect + full output recovered)"
+  skip "AWAITING_APPROVAL reconnect (disconnect during approval; modal restored)"
+  skip "Gap recovery cellular (kill WS mid-stream; gap replayed)"
+  skip "visibilitychange (background + return → reconnect)"
+  skip "Bash 'type APPROVE' (typing APPROVE required; wrong string blocks)"
+  skip "client_error telemetry (inject malformed chunk; verify bridge log)"
+else
+  echo ""
+  yellow "  Manual tests require an iPhone on the tailnet."
+  yellow "  Run with --skip-manual to skip these."
+  echo ""
+  for test in \
+    "WSS trust — iPhone Safari connects without cert warning" \
+    "Auth end-to-end — authenticate → controllerEpoch on device" \
+    "Long task disconnect — cellular drop + reconnect + full output recovered" \
+    "AWAITING_APPROVAL reconnect — modal restored on reconnect within TTL" \
+    "Gap recovery cellular — kill WS mid-stream; output replayed" \
+    "visibilitychange — background + return reconnects" \
+    "Bash APPROVE — wrong string blocks; correct string approves" \
+    "client_error telemetry — malformed chunk → bridge log entry"
+  do
+    read -rp "  PASS/FAIL/SKIP [$test]: " result
+    case "${result,,}" in
+      p|pass) pass "$test" ;;
+      f|fail) fail "$test" ;;
+      *) skip "$test" ;;
+    esac
+  done
+fi
+
+# ──────────────────────────────────────────────────────────────────────────
+# Summary
+echo ""
+echo "══════════════════════════════════════"
+echo "Results: $PASS passed, $FAIL failed, $SKIP skipped"
+echo "══════════════════════════════════════"
+
+if [ "$FAIL" -gt 0 ]; then
+  red "FAIL — $FAIL test(s) failed"
+  exit 1
+else
+  green "PASS — all tests passed"
+  exit 0
+fi
