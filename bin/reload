@@ -22,11 +22,8 @@ NEW_TOKEN=$(openssl rand -hex 32)
 export BRIDGE_AUTH_TOKEN="$NEW_TOKEN"
 export NODE_ENV=production
 
-echo "→ Restarting remotedev-bridge with updated env..."
-pm2 restart remotedev-bridge --update-env
-
-echo "→ Restarting remotedev-ui with updated env..."
-pm2 restart remotedev-ui --update-env
+echo "→ Restarting bridge + UI with updated env (reloads ecosystem.config.local.js)..."
+pm2 restart ecosystem.config.js --update-env
 
 echo "→ Waiting for bridge readiness..."
 BRIDGE_PORT="${BRIDGE_PORT:-7001}"
