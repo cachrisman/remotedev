@@ -488,14 +488,14 @@ export default function Home() {
                 ? 'Enter an instruction...'
                 : 'Waiting for task to complete...'
             }
-            disabled={state.sessionState !== 'IDLE' || showProjectPicker}
+            disabled={state.sessionState !== 'IDLE' || showProjectPicker || connectionState !== 'connected'}
             rows={1}
             className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500 disabled:opacity-50 min-h-[48px] max-h-40"
             style={{ fieldSizing: 'content' } as React.CSSProperties}
           />
           <button
             onClick={handleSend}
-            disabled={state.sessionState !== 'IDLE' || !input.trim() || showProjectPicker}
+            disabled={state.sessionState !== 'IDLE' || !input.trim() || showProjectPicker || connectionState !== 'connected'}
             className="bg-blue-600 text-white px-4 py-3 rounded-xl font-medium active:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
           >
             Send
