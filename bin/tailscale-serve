@@ -1,0 +1,4 @@
+#!/usr/bin/env zsh
+# Managed by pm2 — starts tailscale serve in the foreground.
+# On SIGTERM (pm2 stop/delete), tailscale cleans up the serve rule automatically.
+exec tailscale serve --https=7000 http://localhost:17000

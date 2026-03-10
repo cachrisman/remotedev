@@ -8,12 +8,22 @@
     "ui"
   ],
   "scripts": {
-    "dev": "pm2 start ecosystem.config.js",
+    "dev": "./bin/dev",
+    "stop": "pm2 stop all",
+    "logs": "pm2 logs",
+    "status": "pm2 status",
     "reload": "./bin/reload",
     "test": "node --test bridge-server/test/**/*.test.js",
     "test:tailnet": "./bin/test-tailnet"
   },
   "engines": {
     "node": ">=20 <25"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "pm2": "^6.0.14"
   }
 }

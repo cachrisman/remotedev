@@ -51,18 +51,22 @@ function validateEnv() {
 // Global process traps
 
 function killAllSessions() {
-  try {
-    for (const session of sessionManager.allSessions()) {
-      try {
-        if (session.proc && !session.proc.killed) {
-          process.kill(-session.proc.pid, 'SIGKILL');
-        }
-        if (session.caffeinateProc) {
-          session.caffeinateProc.kill('SIGKILL');
-        }
-      } catch {}
-    }
-  } catch (innerErr) {
+    try {
+      for (const session of sessionManager.allSessions()) {
+        try {
+          if (session.proc) {
+            if (typeof session.proc.kill === 'function') {
+              session.proc.kill('SIGKILL');
+            } else {
+              process.kill(-session.proc.pid, 'SIGKILL');
+            }
+          }
+          if (session.caffeinateProc) {
+            session.caffeinateProc.kill('SIGKILL');
+          }
+        } catch {}
+      }
+    } catch (innerErr) {
     logger.fatal({ innerErr }, 'killAllSessions threw — calling process.abort()');
     process.abort();
   }

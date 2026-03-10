@@ -10,6 +10,13 @@ const CERT_REFUSE_HOURS = 24;
 const DISK_WARN_MB = 500;
 const CLAUDE_MIN_VERSION = process.env.CLAUDE_MIN_VERSION || '0.0.0';
 
+/** Path to claude CLI used for version check and for spawning. Use this when spawning so PATH is not relied on (e.g. under PTY). */
+function getClaudePath() {
+  if (process.env.CLAUDE_PATH) return process.env.CLAUDE_PATH;
+  const defaultPath = path.join(process.env.HOME || '/tmp', '.local', 'bin', 'claude');
+  return defaultPath;
+}
+
 /**
  * Check TLS certificate expiry.
  * Warns at 14/7/3 days; refuses to start if <24h.
@@ -62,7 +69,8 @@ function checkCertExpiry(certPath) {
  */
 function checkClaudeVersion() {
   try {
-    const output = execSync('claude --version', { encoding: 'utf8', timeout: 10000 }).trim();
+    const claudePath = getClaudePath();
+    const output = execSync(`"${claudePath}" --version`, { encoding: 'utf8', timeout: 10000 }).trim();
     logger.info({ version: output, minVersion: CLAUDE_MIN_VERSION }, 'claude CLI version');
 
     if (CLAUDE_MIN_VERSION !== '0.0.0') {
@@ -117,4 +125,4 @@ function runStartupChecks({ certPath, dbDir }) {
   logger.info('Startup checks complete');
 }
 
-module.exports = { runStartupChecks, checkCertExpiry, checkClaudeVersion, checkDiskSpace };
+module.exports = { runStartupChecks, checkCertExpiry, checkClaudeVersion, checkDiskSpace, getClaudePath };

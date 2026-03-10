@@ -1,16 +1,98 @@
 'use strict';
 
-const { spawn, execSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
+const pty = require('node-pty');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { WebSocket } = require('ws');
 
 const logger = require('./logger');
+
+/**
+ * Log diagnostics when PTY spawn fails. On macOS node-pty spawns a helper binary (spawn-helper)
+ * which then execs the target; posix_spawn can fail for the helper or for PTY setup.
+ */
+function logPtySpawnDiagnostics(claudePath, spawnOpts) {
+  const diag = {};
+
+  try {
+    diag.claudePath = claudePath;
+    diag.claudeExists = fs.existsSync(claudePath);
+    if (diag.claudeExists) {
+      const st = fs.statSync(claudePath);
+      diag.claudeMode = st.mode.toString(8);
+      diag.claudeIsFile = st.isFile();
+      diag.claudeIsSymlink = st.isSymbolicLink ? st.isSymbolicLink() : false;
+      try {
+        diag.claudeRealpath = fs.realpathSync(claudePath);
+      } catch {
+        diag.claudeRealpath = null;
+      }
+      try {
+        const head = fs.readFileSync(claudePath, { encoding: 'utf8', flag: 'r' }).slice(0, 120);
+        diag.claudeShebang = head.split('\n')[0] || head;
+      } catch {
+        diag.claudeShebang = null;
+      }
+    }
+  } catch (e) {
+    diag.claudeStatError = e.message;
+  }
+
+  try {
+    const r = spawnSync(claudePath, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      env: spawnOpts.env,
+      cwd: spawnOpts.cwd || undefined,
+    });
+    diag.claudeSpawnSyncOk = r.status === 0;
+    diag.claudeSpawnSyncStatus = r.status;
+    diag.claudeSpawnSyncSignal = r.signal || null;
+    if (r.error) diag.claudeSpawnSyncError = r.error.message;
+  } catch (e) {
+    diag.claudeSpawnSyncError = e.message;
+  }
+
+  try {
+    const nodePtyLib = path.dirname(require.resolve('node-pty'));
+    const nodePtyRoot = path.join(nodePtyLib, '..');
+    const dirs = [
+      path.join(nodePtyLib, 'build/Release'),
+      path.join(nodePtyLib, 'build/Debug'),
+      path.join(nodePtyRoot, 'prebuilds', `${process.platform}-${process.arch}`),
+    ];
+    for (const dir of dirs) {
+      const helperPath = path.join(dir, 'spawn-helper');
+      if (fs.existsSync(helperPath)) {
+        diag.ptyHelperPath = helperPath;
+        const st = fs.statSync(helperPath);
+        diag.ptyHelperExists = true;
+        diag.ptyHelperMode = st.mode.toString(8);
+        diag.ptyHelperExecutable = (st.mode & 0o111) !== 0;
+        break;
+      }
+    }
+    if (!diag.ptyHelperPath) diag.ptyHelperChecked = dirs;
+  } catch (e) {
+    diag.ptyHelperError = e.message;
+  }
+
+  diag.processUid = typeof process.getuid === 'function' ? process.getuid() : null;
+  diag.processGid = typeof process.getgid === 'function' ? process.getgid() : null;
+  diag.platform = process.platform;
+  diag.arch = process.arch;
+  diag.cwd = spawnOpts.cwd || process.cwd();
+  diag.cwdExists = spawnOpts.cwd ? fs.existsSync(spawnOpts.cwd) : true;
+
+  logger.warn({ ptySpawnDiagnostics: diag }, 'PTY spawn diagnostics (macOS: node-pty spawns helper binary first; failure may be helper or PTY setup)');
+}
 const db = require('./db');
 const NdjsonFramer = require('./ndjson-framer');
 const sessionManager = require('./session-manager');
 const { validatePath } = require('./path-validator');
+const { getClaudePath } = require('./startup-checks');
 
 // Constants
 const PROTOCOL_VERSION = 1;
@@ -34,6 +116,30 @@ const APPROVAL_TTL_MS = 60 * 1000;
 
 // Claude version requirements
 const CLAUDE_MIN_VERSION = process.env.CLAUDE_MIN_VERSION || '0.0.0';
+
+// After first PTY spawn failure (e.g. posix_spawnp under pm2), skip PTY for rest of process lifetime to avoid repeated WARN.
+let ptyUnavailable = false;
+
+/** On macOS node-pty spawns a helper binary; some npm installs leave it 0644 (no execute bit). Fix once so PTY can run. */
+function ensurePtyHelperExecutable() {
+  if (process.platform !== 'darwin') return;
+  try {
+    const nodePtyLib = path.dirname(require.resolve('node-pty'));
+    const nodePtyRoot = path.join(nodePtyLib, '..');
+    const helperDir = path.join(nodePtyRoot, 'prebuilds', `${process.platform}-${process.arch}`);
+    const helperPath = path.join(helperDir, 'spawn-helper');
+    if (!fs.existsSync(helperPath)) return;
+    const st = fs.statSync(helperPath);
+    if ((st.mode & 0o111) !== 0) return;
+    fs.chmodSync(helperPath, 0o755);
+    logger.info({ helperPath }, 'Set node-pty spawn-helper executable (was 0644); PTY spawn may now succeed');
+  } catch (e) {
+    logger.debug({ err: e.message }, 'Could not fix spawn-helper permissions');
+  }
+}
+
+// Fix spawn-helper permissions at startup so first PTY attempt can succeed (no need to wait for first spawn).
+ensurePtyHelperExecutable();
 
 class Session {
   constructor(id, name, workingDir) {
@@ -222,18 +328,47 @@ class Session {
       REMOTEDEV_SESSION_ID: this.id,
     };
 
-    this.proc = spawn('claude', [
-      '-p',
-      '--output-format', 'stream-json',
-      '--allowedTools', 'all',
-      instruction,
-    ], {
-      cwd: this.resolvedWorkingDir || this.workingDir,
-      env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: true,
-    });
+    // PTY first (when available): stream-json is documented for pipe use but the CLI buffers when stdout is not a TTY.
+    // If PTY fails once (e.g. posix_spawnp under pm2), we set ptyUnavailable and use pipe only for the rest of this process.
+    const claudePath = getClaudePath();
+    const spawnArgs = ['-p', '--output-format', 'stream-json', '--verbose', '--allowedTools', 'all', instruction];
+    const spawnOpts = { cwd: this.resolvedWorkingDir || this.workingDir, env };
+    let proc;
+    let isPty = false;
 
+    if (ptyUnavailable) {
+      logger.info({ sessionId: this.id }, 'Using pipe spawn (PTY failed earlier this process). Restart bridge (npm run reload) to retry PTY.');
+      try {
+        proc = spawn(claudePath, spawnArgs, { ...spawnOpts, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      } catch (err) {
+        logger.error({ sessionId: this.id, err, claudePath }, 'Claude spawn failed');
+        this.endSession('proc_spawn_failed');
+        return;
+      }
+    } else {
+      try {
+        proc = pty.spawn(claudePath, spawnArgs, {
+          ...spawnOpts,
+          cols: 80,
+          rows: 24,
+        });
+        isPty = true;
+      } catch (err) {
+        ptyUnavailable = true;
+        logPtySpawnDiagnostics(claudePath, spawnOpts);
+        logger.warn({ sessionId: this.id, err: err.message, claudePath }, 'PTY spawn failed, using pipe for this process (output may be buffered)');
+        try {
+          proc = spawn(claudePath, spawnArgs, { ...spawnOpts, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+        } catch (err2) {
+          logger.error({ sessionId: this.id, err: err2, claudePath }, 'Claude spawn failed');
+          this.endSession('proc_spawn_failed');
+          return;
+        }
+      }
+    }
+
+    this.proc = proc;
+    this._isPty = isPty;
     this.state = 'RUNNING';
     db.updateSessionState(this.id, 'RUNNING');
     db.insertAuditLog(this.id, this.rootMessageId, 'session_start', {
@@ -244,35 +379,59 @@ class Session {
       sessionId: this.id,
       pid: this.proc.pid,
       rootMessageId: this.rootMessageId,
+      pty: isPty,
     }, 'Claude process spawned');
 
-    this.proc.stdout.on('data', (chunk) => {
-      if (this.destroyed) return;
-      this._framer.push(chunk);
-    });
+    this._sendStateSync();
 
-    this.proc.stderr.on('data', (chunk) => {
-      if (this.destroyed) return;
-      const text = chunk.toString('utf8');
-      const event = this._buildEnvelope({
-        type: 'output',
-        payload: { type: 'stderr', text: text.slice(0, 1024 * 1024) },
+    this._firstStdoutLogged = false;
+    this._firstNdjsonLineLogged = false;
+
+    if (isPty) {
+      this.proc.onData((chunk) => {
+        if (this.destroyed) return;
+        if (!this._firstStdoutLogged) {
+          this._firstStdoutLogged = true;
+          logger.info({ sessionId: this.id, bytes: chunk.length }, 'First stdout chunk from Claude');
+        }
+        this._framer.push(chunk);
       });
-      this._emitAndBuffer(event);
-    });
-
-    this.proc.on('close', (code, signal) => {
-      if (this.destroyed) return;
-      logger.info({ sessionId: this.id, code, signal }, 'Claude process closed');
-      this._framer.flush();
-      this.endSession(`proc_exit:${code ?? signal ?? 'unknown'}`);
-    });
-
-    this.proc.on('error', (err) => {
-      if (this.destroyed) return;
-      logger.error({ sessionId: this.id, err }, 'Claude process error');
-      this.endSession('proc_error');
-    });
+      this.proc.onExit(({ exitCode, signal }) => {
+        if (this.destroyed) return;
+        logger.info({ sessionId: this.id, code: exitCode, signal }, 'Claude process closed');
+        this._framer.flush();
+        this.endSession(`proc_exit:${exitCode ?? signal ?? 'unknown'}`);
+      });
+    } else {
+      this.proc.stdout.on('data', (chunk) => {
+        if (this.destroyed) return;
+        if (!this._firstStdoutLogged) {
+          this._firstStdoutLogged = true;
+          logger.info({ sessionId: this.id, bytes: chunk.length }, 'First stdout chunk from Claude');
+        }
+        this._framer.push(chunk);
+      });
+      this.proc.stderr.on('data', (chunk) => {
+        if (this.destroyed) return;
+        const text = chunk.toString('utf8');
+        const event = this._buildEnvelope({
+          type: 'output',
+          payload: { type: 'stderr', text: text.slice(0, 1024 * 1024) },
+        });
+        this._emitAndBuffer(event);
+      });
+      this.proc.on('close', (code, signal) => {
+        if (this.destroyed) return;
+        logger.info({ sessionId: this.id, code, signal }, 'Claude process closed');
+        this._framer.flush();
+        this.endSession(`proc_exit:${code ?? signal ?? 'unknown'}`);
+      });
+      this.proc.on('error', (err) => {
+        if (this.destroyed) return;
+        logger.error({ sessionId: this.id, err }, 'Claude process error');
+        this.endSession('proc_error');
+      });
+    }
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -280,6 +439,11 @@ class Session {
 
   _onNdjsonLine(line) {
     if (this.destroyed) return;
+
+    if (!this._firstNdjsonLineLogged) {
+      this._firstNdjsonLineLogged = true;
+      logger.info({ sessionId: this.id, linePreview: line.slice(0, 80) }, 'First NDJSON line from Claude');
+    }
 
     let parsed;
     try {
@@ -392,19 +556,18 @@ class Session {
   _emitControlResponse(requestId, decision) {
     if (this.destroyed) return;
 
-    // Send to subprocess stdin
-    if (this.proc && !this.proc.killed && this.proc.stdin.writable) {
-      try {
-        this.proc.stdin.write(JSON.stringify({
-          type: 'control_response',
-          requestId,
-          decision,
-        }) + '\n');
-      } catch {}
-    }
+    // Send to subprocess stdin (pty.write for node-pty, .stdin.write for child_process)
+    if (!this.proc) return;
+    try {
+      if (this._isPty) {
+        this.proc.write(JSON.stringify({ type: 'control_response', requestId, decision }) + '\n');
+      } else if (this.proc.stdin && this.proc.stdin.writable) {
+        this.proc.stdin.write(JSON.stringify({ type: 'control_response', requestId, decision }) + '\n');
+      }
+    } catch {}
 
     this.pendingApproval = null;
-    this.state = this.proc && !this.proc.killed ? 'RUNNING' : 'IDLE';
+    this.state = this.proc ? 'RUNNING' : 'IDLE';
     db.updateSessionState(this.id, this.state);
     db.insertAuditLog(this.id, this.rootMessageId, 'approval_resolved', {
       requestId, decision,
@@ -697,13 +860,20 @@ class Session {
       this.caffeinateProc = null;
     }
 
-    // 6. Kill process group
-    if (this.proc && !this.proc.killed) {
-      try { process.kill(-this.proc.pid, 'SIGTERM'); } catch {}
+    // 6. Kill claude process (node-pty: .kill(); child_process would use process.kill(-pid))
+    if (this.proc) {
+      try {
+        if (typeof this.proc.kill === 'function') {
+          this.proc.kill('SIGTERM');
+        } else {
+          process.kill(-this.proc.pid, 'SIGTERM');
+        }
+      } catch {}
       const procRef = this.proc;
       setTimeout(() => {
         try {
-          if (!procRef.killed) process.kill(-procRef.pid, 'SIGKILL');
+          if (typeof procRef.kill === 'function') procRef.kill('SIGKILL');
+          else process.kill(-procRef.pid, 'SIGKILL');
         } catch {}
       }, 5000).unref();
       this.proc = null;

@@ -502,4 +502,287 @@ The following items were identified during implementation as incomplete or requi
 
 ---
 
-*End of implementation log. For the original specification, see `docs/PLAN.md`. For operational procedures, see `docs/USER_GUIDE.md`. For what to do next, see `docs/TODO.md`.*
+*End of initial implementation log. For the original specification, see `docs/PLAN.md`. For operational procedures, see `docs/USER_GUIDE.md`. For what to do next, see `docs/TODO.md`.*
+
+---
+
+## Post-Initial Implementation — Branch `claude/remotedev-v0-16-bM4xb`
+
+**Date:** February 2026 — first-run fixes and build stabilization sprint.
+
+This section records all changes made after the initial v0.16 baseline was written. It covers the sequence of fixes required to get from "code written but never run" to "builds and installs cleanly."
+
+---
+
+### Fix: NdjsonFramer `line_too_long` not firing on single-push oversized lines
+
+**Commit:** `af19926`
+
+**Bug:** `ndjson-framer.js` had a flaw in the `line_too_long` detection path. When an oversized line (>1MB) arrived as a single `push()` call (i.e., the entire oversized line in one chunk, not accumulated across multiple calls), the truncation logic did not fire. Only the accumulation path was guarded.
+
+**Fix:** Added the size check at the top of `push()` before the append-and-scan loop, so an incoming chunk that already exceeds the limit triggers truncation recovery immediately, regardless of whether the buffer was previously empty.
+
+**Why this matters:** The 1MB cap is a memory-safety guard. Without this fix, a single malformed `claude` output line could exhaust heap.
+
+---
+
+### Chore: Add `package-lock.json`
+
+**Commit:** `df0197b`
+
+The initial implementation was committed without running `npm install`, so no lockfile existed. Added `package-lock.json` at the root workspace level to pin dependency versions for reproducible installs.
+
+**Decision:** Use npm workspaces (root lockfile) rather than separate lockfiles per workspace. This keeps `npm install` at the root working correctly for both `bridge-server/` and `ui/`.
+
+---
+
+### Fix: Pin Node.js to 22 LTS
+
+**Commit:** `15757b3`
+**File:** `.nvmrc`
+
+`better-sqlite3` provides prebuilt native binaries only for Node.js LTS versions. Node 25 (latest at time of writing) is not an LTS release and has no prebuilt binaries, causing `npm install` to fall back to compiling from source — which fails without a matching `node-pre-gyp` toolchain.
+
+**Fix:** Added `.nvmrc` pinning Node 22 LTS. The spec already referenced Node 20–22; this makes it explicit and machine-enforced.
+
+**Decision:** Node 22 (not 20) because 22 is the current LTS. The bridge uses no APIs deprecated between 20 and 22.
+
+---
+
+### Security fix: Next.js 14.2.3 → 14.2.35
+
+**Commit:** `ca0fb0b`
+**PR:** #1 / #2
+
+The initial implementation used Next.js 14.2.3, which has known critical CVEs. Upgraded to 14.2.35 (latest patch in the 14.x line at the time) to resolve them.
+
+**Decision:** Stayed on 14.x rather than immediately jumping to 15/16, to minimize scope. The UI upgrade to Next.js 16 followed in the same sprint (see below).
+
+---
+
+### Fix: Documentation — Tailscale cert setup instructions
+
+**Commits:** `6c9b816`, `0fdf994`
+
+The initial `docs/USER_GUIDE.md` had incorrect instructions for `tailscale cert`:
+- Wrong output path (`/etc/tailscale/` instead of the current directory or `~/.config/tailscale/`)
+- Incorrect ACL configuration section (missing the port numbers used by this project: 7000, 7001)
+
+Fixed both. Also updated the Next.js version references in docs to reflect the actual version in use.
+
+---
+
+### Fix: `ecosystem.config.local.js` is a JS module, not a shell script
+
+**Commit:** `ce47e16`
+
+`bin/setup` originally included a comment suggesting the operator could `source ecosystem.config.local.js` to load the environment variables. This is wrong — the file is a Node.js CommonJS module (`module.exports = { ... }`), not a shell script.
+
+**Fix:** Removed the misleading `source` reference from `bin/setup`. The file is loaded by pm2 automatically at startup via `merge_defaults` in `ecosystem.config.js`. Operators who need env vars in their shell should use `pm2 env remotedev-bridge` or read the file directly.
+
+---
+
+### Fix: Align `UseWebSocketReturn` `send` type with implementation
+
+**Commit:** `4587043`
+**File:** `ui/hooks/useWebSocket.ts`
+
+The TypeScript type exported by `useWebSocket` had `send: (msg: object) => void` but the implementation accepted `send: (msg: OutboundMessage) => void` (where `OutboundMessage` is the Zod-inferred union from `protocol.ts`). This caused TypeScript to emit an error at the call site in `page.tsx`.
+
+**Fix:** Updated the return type annotation to match the implementation. Single-source-of-truth: Zod inferred types from `protocol.ts`.
+
+---
+
+### Feature: Upgrade to Next.js 16 and React 19
+
+**Commit:** `37d2f65`
+**PR:** #3
+
+**What changed:**
+- Upgraded `next` from 14.x → 16 and `react`/`react-dom` from 18 → 19.
+- Removed a `import { createHmac } from 'crypto'` import in `/api/token/route.ts`. Next.js 16's App Router runs API routes in the Edge Runtime by default in some configurations, and Node's `crypto` module is not available in the Edge Runtime. Replaced with the Web Crypto API (`crypto.subtle.importKey` / `crypto.subtle.sign`).
+- Updated `tsconfig.json` to target `ES2022` (required by React 19 types).
+
+**Decision:** Jump to 16 (not 15) because:
+1. 16 is the current stable release at time of implementation.
+2. 14 and 15 have overlap in breaking changes; doing two upgrades is more work than one.
+3. The UI is simple enough (no Pages Router, no complex middleware) that the upgrade was low-risk.
+
+**Complication — Web Crypto API vs Node `crypto`:**
+The HMAC in `/api/token/route.ts` was originally `createHmac('sha256', secret).update(payload).digest('hex')`. Web Crypto's `subtle.sign` is async and uses `ArrayBuffer`s rather than strings. The rewrite is slightly more verbose but is runtime-agnostic (works in both Node and Edge runtimes).
+
+---
+
+### Fix: Duplicate React instance in production build
+
+**Commit:** `1b86fa4`
+
+Running `npm run build` in the `ui/` workspace failed with a "duplicate React" error. The root cause: the monorepo root `package.json` declared `react` and `react-dom` as dependencies (to satisfy pm2's workspace resolution), and the `ui/package.json` also declared them. npm hoisted both, but the versions resolved differently, producing two React instances on the module graph.
+
+**Fix:** Removed `react` and `react-dom` from the root `package.json` (they belong only in `ui/`). Added `"dedupe": true` logic via `npm dedupe` in the lock file. Also added `alias` entries in `ui/next.config.js` to pin React resolution to the `ui/node_modules/react` copies:
+
+```js
+// ui/next.config.js
+webpack: (config) => {
+  config.resolve.alias['react'] = path.resolve('./node_modules/react');
+  config.resolve.alias['react-dom'] = path.resolve('./node_modules/react-dom');
+  return config;
+}
+```
+
+**Why this matters:** Duplicate React causes hooks to break at runtime in production (`useState` from one copy, component tree from another). The alias ensures Next.js's bundler always resolves to the same React copy.
+
+---
+
+### Chore: Gitignore `ecosystem.config.local.js`; add `GlobalErrorContent`
+
+**Commit:** `463fa7c`
+
+Two items in one commit:
+
+1. **`.gitignore`:** Added `ecosystem.config.local.js`. This file is generated by `bin/setup` and contains `BRIDGE_AUTH_TOKEN` and `REMOTEDEV_CLIENT_SECRET`. It was not previously gitignored (identified as a known gap in the initial implementation log). Fixed.
+
+2. **`ui/app/GlobalErrorContent.tsx`:** The root error boundary (`ui/app/layout.tsx`) references a `GlobalErrorContent` component for the `error.tsx` fallback, but the component file was missing from the initial implementation. Added it. It renders a minimal "Something went wrong" message with a reload button and reports the error over the WebSocket `client_error` channel when available.
+
+3. **`ui/next-env.d.ts`:** Auto-generated by Next.js 16. Added to the repo so TypeScript can find the Next.js global type augmentations (e.g., `PageProps`, `LayoutProps`).
+
+---
+
+### Fix: Use `tailscale serve` for UI HTTPS instead of a custom Node server
+
+**Commit:** `7d2907f`
+
+**Problem:** Next.js's `next start` does not support TLS natively. The initial plan assumed a custom Node.js HTTPS wrapper around `next start`. During implementation, it became clear this approach had two issues:
+1. The custom wrapper would need to duplicate TLS cert loading logic already present in the bridge.
+2. pm2's process management would need to be aware of the wrapper script, not `next start`, complicating restarts.
+
+**Solution:** Use `tailscale serve` as a zero-code HTTPS reverse proxy:
+
+```
+iPhone Safari  →  https://<host>:7000  →  tailscale serve  →  http://localhost:17000 (Next.js)
+```
+
+`tailscale serve` handles TLS termination using the same Tailscale-issued cert that the bridge uses for WSS. This means:
+- No custom TLS code in the UI process.
+- Next.js binds only to `127.0.0.1:17000` (not reachable from the network directly).
+- The Tailscale ACL grants the iPhone access to port 7000 (HTTPS via tailscale serve); direct access to 17000 is not needed.
+
+**Changes:**
+- `ecosystem.config.js`: Added `remotedev-tailscale-serve` pm2 app (`tailscale serve --https=7000 http://localhost:17000`). Changed UI `HOST` from `0.0.0.0` to `127.0.0.1` and port from `7000` to `17000`.
+- `bin/setup`: Added Step 3 to configure `tailscale serve` idempotently (checks if already configured before running). Renumbered subsequent steps. Added the iPhone Safari URL to the setup summary output.
+- `bin/tailscale-serve`: New bin script to manage the `tailscale serve` configuration independently (start, stop, status subcommands).
+
+**Architectural decision — port numbering:**
+- `7000`: Public HTTPS port (via Tailscale — what the iPhone sees)
+- `7001`: Bridge WSS (direct TLS, reachable on Tailnet)
+- `17000`: Internal Next.js HTTP (localhost only, not exposed)
+
+---
+
+### AGENTS.md added
+
+**Commit:** `469a02b`
+
+Added `AGENTS.md` to the repository root. This file provides guidelines for Claude Code and other AI agents working in this codebase: project layout, non-negotiable security rules, code style conventions, development workflow, test instructions, common pitfalls, and references to key documentation.
+
+**Rationale:** The project's security model is complex and easy to violate accidentally (e.g., `pm2 reload` vs `pm2 restart`, `force-dynamic` on the token route, path validator algorithm). A dedicated agent guide reduces the risk of AI-assisted changes inadvertently breaking security invariants.
+
+---
+
+### Spawn Claude under PTY (node-pty) so stream-json flushes
+
+**Commit:** `b05b478`
+
+The docs state that `--output-format stream-json` is intended for pipe and programmatic use (e.g. "works seamlessly with Unix pipes"). In practice, when the bridge spawned `claude` with `stdio: ['pipe', 'pipe', 'pipe']`, the CLI did not flush stdout — the bridge received no data until the process exited, so the UI showed "Running" but no output. This matches reported behavior in anthropics/claude-code#12965 and related issues: output is buffered when stdout is not a TTY. The suggested fix there was to make the CLI stream when stdout is a pipe; until that is fixed upstream, we spawn `claude` under a pseudo-TTY (via `node-pty`) so the process sees a TTY and uses line-buffered stdout. No CLI flag or documented env var was found to force unbuffered output. The bridge now uses `pty.spawn()` for the claude process only; caffeinate and all other logic are unchanged. Kill path and `killAllSessions` support both PTY (`.kill()`) and legacy ChildProcess (`process.kill(-pid)`).
+
+---
+
+### PTY spawn failure: spawn-helper not executable + diagnostics
+
+**Commit:** `b05b478`
+
+On macOS, node-pty does not exec the target directly; it spawns a **spawn-helper** binary (under `prebuilds/darwin-*/spawn-helper`) which then execs the real process. Diagnostics showed `ptyHelperMode: "100644"` and `ptyHelperExecutable: false` — the helper had no execute bit, so `posix_spawn` failed with "posix_spawnp failed." Some npm installs or prebuild packs ship the helper with mode 0644. **Fix:** Before the first PTY spawn attempt, the bridge calls `ensurePtyHelperExecutable()`: on darwin it stat's the helper and, if it exists but is not executable, does `chmod(helperPath, 0o755)` and logs one line. No restart required for that fix to take effect for the next spawn; after any other bridge code or config change, run **`npm run reload`** (or `./bin/reload`) so the bridge and UI restart with the new code.
+
+**Observability:** When PTY spawn fails, the bridge logs a `ptySpawnDiagnostics` object (claude path/stat/shebang, `claudeSpawnSyncOk`, spawn-helper path and executable bit, process uid/gid, cwd). That made the 0644 helper the obvious cause.
+
+---
+
+### Ops: pm2-managed tailscale serve, `bin/dev` launcher, PATH/interpreter fixes
+
+**Commit:** `9f4b0ba`
+
+Several operational improvements to make the dev/production workflow more robust:
+
+**`bin/dev`** — New launcher script. Starts (or restarts) all pm2 apps via `ecosystem.config.js`, then streams logs. `Ctrl+C` exits the log tail; services keep running. Companion scripts: `npm run stop`, `npm run status`, `npm run logs`.
+
+**`bin/tailscale-serve`** — Foreground wrapper (`exec tailscale serve --https=7000 http://localhost:17000`) managed by pm2 as `remotedev-tailscale-serve`. Previously `tailscale serve --bg` was run once by `bin/setup` as a persistent background rule. The new approach lets pm2 own the lifecycle: stop/restart/delete all work. `bin/setup` was reworked to clear any leftover persistent `--bg` rules from previous setups.
+
+**`ecosystem.config.js` PATH fix** — pm2 daemon often runs with a stripped `PATH` (whatever was in scope when `pm2 startup` installed the launchd plist). This caused `claude` to not be found at spawn time. Fix: prepend `$HOME/.local/bin` to `PATH` in the bridge's env block.
+
+**`BRIDGE_NODE` interpreter pin** — `ecosystem.config.js` now sets `interpreter: process.env.BRIDGE_NODE || 'node'`. This ensures pm2 uses the same Node version the native addons (`better-sqlite3`, `node-pty`, `re2`) were compiled for, regardless of which Node the pm2 daemon was started with.
+
+**`bin/reload`** — Added `export NODE_ENV=production` so the bridge picks up the correct environment on restart.
+
+---
+
+### Security: Move secrets from build-time `NEXT_PUBLIC_*` to runtime `/api/token`
+
+**Commit:** `72a6f23`
+
+**Problem:** `NEXT_PUBLIC_BRIDGE_WS_URL`, `NEXT_PUBLIC_CLIENT_SECRET`, and `NEXT_PUBLIC_WORKING_DIR` were baked into the Next.js client bundle at build time. Rotating secrets required a full `npm run build`. Worse, `NEXT_PUBLIC_CLIENT_SECRET` was visible in the browser's JS source — not a direct vulnerability (it's only used for HMAC assertion), but unnecessary exposure.
+
+**Fix:** All three are now server-side env vars (`BRIDGE_WS_URL`, `REMOTEDEV_CLIENT_SECRET`, `ALLOWED_ROOTS`) read only by the `/api/token` route, which returns them alongside the HMAC assertion at runtime. The client fetches config on mount. No rebuild needed when secrets rotate — just `npm run reload`.
+
+**Files:** `ui/app/api/token/route.ts`, `ui/hooks/useWebSocket.ts`, `ecosystem.config.js` (env renames).
+
+---
+
+### Feature: Project picker for multiple `ALLOWED_ROOTS`
+
+**Commit:** `08dcf5d`
+
+When `ALLOWED_ROOTS` contains multiple colon-separated directories (e.g. `~/Code:~/Projects`), the UI now shows a project picker before creating a session. The user taps one of the roots, and `create_session` is sent with that directory as `workingDir`. When there's only one root (or none), the picker is skipped and sessions auto-create on authentication as before.
+
+**State changes:** Added `CLEAR_SESSION` reducer action (resets sessionId, state, and messages) and a "New Session" button in the header for starting fresh.
+
+---
+
+### Feature: iPhone safe-area support
+
+**Commit:** `08dcf5d`
+
+The UI now renders edge-to-edge on iPhone (including under the Dynamic Island / notch and home indicator):
+
+- `layout.tsx`: Added `viewport-fit: cover` via Next.js `Viewport` export.
+- `globals.css`: Added `.pt-safe` / `.pb-safe` utility classes using `env(safe-area-inset-top)` / `env(safe-area-inset-bottom)`.
+- `page.tsx`: Header uses `pt-safe`, input area uses `pb-safe` with a `max()` fallback for devices without safe areas.
+
+---
+
+### Fix: Assistant message parsing in `ChatMessage.tsx`
+
+**Commit:** `08dcf5d`
+
+**Bug:** `payloadToText` looked for `payload.content` on `assistant` type messages, but Claude's stream-json wraps content under `payload.message.content`. The UI showed nothing for assistant messages.
+
+**Fix:** Read `content` from `payload.message.content`. Also added rendering for `tool_use` blocks: they now display as `[tool_name]` followed by the JSON input, so the user can see what tools Claude is invoking.
+
+---
+
+### Chore: Logger always uses pino-pretty
+
+**Commit:** `b05b478`
+
+Previously `bridge-server/logger.js` only used `pino-pretty` when `NODE_ENV !== 'production'`. Since all bridge logs are read by humans (pm2 log files or `pm2 logs` terminal), pretty-printing is always useful. Changed to unconditionally use `pino-pretty` with compact timestamps (`HH:MM:ss`) and suppressed `pid`/`hostname` fields. Moved `pino-pretty` from `devDependencies` to `dependencies` in `bridge-server/package.json`.
+
+---
+
+### Chore: `getClaudePath()` for absolute-path spawning
+
+**Commit:** `b05b478`
+
+Added `getClaudePath()` to `startup-checks.js` (exported). Returns `process.env.CLAUDE_PATH` if set, otherwise `$HOME/.local/bin/claude`. Used by both `checkClaudeVersion()` and `session.js` spawn. This avoids relying on `PATH` resolution at spawn time, which is fragile under pm2 where the daemon PATH may differ from the user's shell.
+
+---
+
+*For the original specification, see `docs/PLAN.md`. For operational procedures, see `docs/USER_GUIDE.md`. For what to do next, see `docs/TODO.md`.*
