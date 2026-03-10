@@ -17,13 +17,13 @@ export function WarningBanner({ subtype, onDismiss }: WarningBannerProps) {
   const message = MESSAGES[subtype] || `Bridge warning: ${subtype}`;
 
   return (
-    <div className="bg-amber-900/60 border border-amber-700 rounded-xl mx-4 px-4 py-3 flex items-center gap-3">
-      <span className="text-amber-400 text-lg">⚠</span>
-      <span className="text-sm text-amber-200 flex-1">{message}</span>
+    <div className="bg-amber-50 dark:bg-amber-900/60 border border-amber-300 dark:border-amber-700 rounded-xl mx-4 px-4 py-3 flex items-center gap-3">
+      <span className="text-amber-500 dark:text-amber-400 text-lg">⚠</span>
+      <span className="text-sm text-amber-800 dark:text-amber-200 flex-1">{message}</span>
       {onDismiss && (
         <button
           onClick={onDismiss}
-          className="text-amber-400 text-sm hover:text-amber-200"
+          className="text-amber-500 dark:text-amber-400 text-sm hover:text-amber-700 dark:hover:text-amber-200"
         >
           ✕
         </button>

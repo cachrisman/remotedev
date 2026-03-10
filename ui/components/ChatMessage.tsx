@@ -32,7 +32,7 @@ export function ChatMessage({ entry }: ChatMessageProps) {
         className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
           isUser
             ? 'bg-blue-600 text-white rounded-br-sm'
-            : 'bg-gray-800 text-gray-100 rounded-bl-sm'
+            : 'bg-gray-100 dark:bg-gray-800 text-gray-800 dark:text-gray-100 rounded-bl-sm'
         }`}
       >
         <pre className="whitespace-pre-wrap break-words font-sans">{entry.content}</pre>

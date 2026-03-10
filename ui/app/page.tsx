@@ -92,11 +92,34 @@ function basename(p: string) {
 // ──────────────────────────────────────────────────────────────────────────
 // Component
 
+function useDarkMode() {
+  const [dark, setDark] = useState(true);
+  useEffect(() => {
+    const stored = localStorage.getItem('theme');
+    setDark(stored !== 'light');
+  }, []);
+  const toggle = useCallback(() => {
+    setDark(prev => {
+      const next = !prev;
+      if (next) {
+        document.documentElement.classList.add('dark');
+        localStorage.setItem('theme', 'dark');
+      } else {
+        document.documentElement.classList.remove('dark');
+        localStorage.setItem('theme', 'light');
+      }
+      return next;
+    });
+  }, []);
+  return { dark, toggle };
+}
+
 export default function Home() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const rootMessageIdRef = useRef<string | null>(null);
+  const { dark, toggle: toggleDark } = useDarkMode();
 
   // Runtime config fetched from token endpoint (allowedRoots, bridgeWsUrl)
   const [allowedRoots, setAllowedRoots] = useState<string[]>([]);
@@ -383,13 +406,13 @@ export default function Home() {
     <div className="flex flex-col h-dvh max-w-2xl mx-auto">
 
       {/* Header: background fills through the Dynamic Island / notch via pt-safe */}
-      <header className="flex-shrink-0 bg-gray-900 border-b border-gray-800 pt-safe">
+      <header className="flex-shrink-0 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-800 pt-safe">
         <div className="flex items-center justify-between px-4 py-2">
           {/* Left: identity + working dir */}
           <div className="flex items-center gap-2 min-w-0">
             <div className={`w-2 h-2 rounded-full flex-shrink-0 ${statusColor}`} />
             <div className="min-w-0">
-              <span className="font-semibold text-sm text-white">RemoteDev</span>
+              <span className="font-semibold text-sm text-gray-900 dark:text-white">RemoteDev</span>
               {selectedWorkingDir && (
                 <span className="ml-2 text-xs text-gray-500 truncate">
                   {basename(selectedWorkingDir)}
@@ -398,9 +421,16 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Right: session state + stop */}
+          {/* Right: session state + dark toggle + stop */}
           <div className="flex items-center gap-2 flex-shrink-0">
-            <span className="text-xs text-gray-400">{sessionStatus}</span>
+            <span className="text-xs text-gray-600 dark:text-gray-400">{sessionStatus}</span>
+            <button
+              onClick={toggleDark}
+              className="text-base leading-none px-1 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
+              aria-label="Toggle dark mode"
+            >
+              {dark ? '☀' : '🌙'}
+            </button>
             {(state.sessionState === 'RUNNING' || state.sessionState === 'AWAITING_APPROVAL') && (
               <button
                 onClick={handleStop}
@@ -437,16 +467,16 @@ export default function Home() {
         {showProjectPicker ? (
           // Project picker: shown before session creation when multiple roots exist
           <div className="flex flex-col items-center justify-center h-full gap-3 px-6">
-            <p className="text-gray-300 font-medium text-base">Choose a project</p>
+            <p className="text-gray-700 dark:text-gray-300 font-medium text-base">Choose a project</p>
             <p className="text-gray-500 text-sm text-center">Select the working directory for this session</p>
             <div className="w-full space-y-2 mt-2">
               {allowedRoots.map(root => (
                 <button
                   key={root}
                   onClick={() => handlePickProject(root)}
-                  className="w-full bg-gray-800 active:bg-gray-700 px-4 py-3 rounded-xl text-left transition-colors"
+                  className="w-full bg-gray-100 dark:bg-gray-800 active:bg-gray-200 dark:active:bg-gray-700 px-4 py-3 rounded-xl text-left transition-colors"
                 >
-                  <div className="font-medium text-white text-sm">{basename(root)}</div>
+                  <div className="font-medium text-gray-900 dark:text-white text-sm">{basename(root)}</div>
                   <div className="text-xs text-gray-500 mt-0.5 truncate">{root}</div>
                 </button>
               ))}
@@ -472,7 +502,7 @@ export default function Home() {
       </div>
 
       {/* Input: pb-safe keeps it above the home indicator */}
-      <div className="flex-shrink-0 border-t border-gray-800 bg-gray-900 px-4 pt-3 pb-safe" style={{ paddingBottom: `max(env(safe-area-inset-bottom), 12px)` }}>
+      <div className="flex-shrink-0 border-t border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-4 pt-3 pb-safe" style={{ paddingBottom: `max(env(safe-area-inset-bottom), 12px)` }}>
         <div className="flex gap-2 items-end">
           <textarea
             value={input}
@@ -490,7 +520,7 @@ export default function Home() {
             }
             disabled={state.sessionState !== 'IDLE' || showProjectPicker || connectionState !== 'connected'}
             rows={1}
-            className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500 disabled:opacity-50 min-h-[48px] max-h-40"
+            className="flex-1 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-xl px-4 py-3 text-gray-900 dark:text-white placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500 disabled:opacity-50 min-h-[48px] max-h-40"
             style={{ fieldSizing: 'content' } as React.CSSProperties}
           />
           <button

@@ -345,7 +345,11 @@ class Session {
     const claudePath = getClaudePath();
     // --verbose is intentionally omitted: in PTY mode stderr is merged with stdout,
     // so verbose/debug lines would corrupt the NDJSON stream and trigger parse errors.
-    const spawnArgs = ['-p', '--output-format', 'stream-json', '--allowedTools', 'all', instruction];
+    // --allowedTools is intentionally omitted: without an allowlist every tool call
+    // requires stdin approval — which is exactly what the bridge provides via its
+    // AWAITING_APPROVAL FSM state. Passing '--allowedTools all' would auto-approve
+    // every tool and bypass the approval modal entirely.
+    const spawnArgs = ['-p', '--output-format', 'stream-json', instruction];
     const spawnOpts = { cwd: this.resolvedWorkingDir || this.workingDir, env };
     let proc;
     let isPty = false;
@@ -571,13 +575,21 @@ class Session {
   _emitControlResponse(requestId, decision) {
     if (this.destroyed) return;
 
-    // Send to subprocess stdin (pty.write for node-pty, .stdin.write for child_process)
+    // Send tool_result to subprocess stdin so Claude Code CLI continues execution.
+    // Claude's --output-format stream-json mode expects a JSON array containing a
+    // tool_result message on stdin after each tool_use event. An empty content
+    // string means "approved, proceed"; is_error:true with a reason string means
+    // "denied, do not execute".
     if (!this.proc) return;
+    const toolResult = decision === 'approve'
+      ? [{ type: 'tool_result', tool_use_id: requestId, content: '' }]
+      : [{ type: 'tool_result', tool_use_id: requestId, content: 'User denied this action.', is_error: true }];
+    const msg = JSON.stringify(toolResult) + '\n';
     try {
       if (this._isPty) {
-        this.proc.write(JSON.stringify({ type: 'control_response', requestId, decision }) + '\n');
+        this.proc.write(msg);
       } else if (this.proc.stdin && this.proc.stdin.writable) {
-        this.proc.stdin.write(JSON.stringify({ type: 'control_response', requestId, decision }) + '\n');
+        this.proc.stdin.write(msg);
       }
     } catch {}
 

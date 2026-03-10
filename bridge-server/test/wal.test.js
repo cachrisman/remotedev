@@ -30,6 +30,30 @@ describe('WAL checkpoint', () => {
     // We can't easily verify it was skipped without mocking, but ensure no error
     assert.doesNotThrow(() => maybeCheckpointWal());
   });
+
+  it('database journal_mode is WAL', () => {
+    const database = db.getDb();
+    assert.ok(database, 'db.getDb() must return the database instance');
+    const result = database.pragma('journal_mode', { simple: true });
+    assert.equal(result, 'wal', `Expected journal_mode=wal, got ${result}`);
+  });
+
+  it('checkpoint uses PASSIVE mode (source-level assertion)', () => {
+    // Read the wal.js source and confirm it uses wal_checkpoint(PASSIVE), not a
+    // blocking mode (TRUNCATE / RESTART / FULL). Guards against regressions.
+    const walSource = fs.readFileSync(
+      path.join(__dirname, '..', 'wal.js'),
+      'utf8'
+    );
+    assert.ok(
+      walSource.includes("wal_checkpoint(PASSIVE)"),
+      'wal.js must use PASSIVE checkpoint mode'
+    );
+    assert.ok(
+      !walSource.includes('TRUNCATE') && !walSource.includes('RESTART') && !walSource.includes('FULL'),
+      'wal.js must not use a blocking checkpoint mode (TRUNCATE/RESTART/FULL)'
+    );
+  });
 });
 
 after(() => {
