@@ -1,5 +1,7 @@
 # AGENTS.md — RemoteDev
 
+Version: 1
+
 Guidelines for Claude Code and other AI agents working in this repository.
 
 ## Default workflow: investigate → plan → confirm → implement
@@ -212,6 +214,7 @@ When making a non-trivial change:
 1. **`docs/IMPLEMENTATION_LOG.md`** — Add a section describing what changed, why, and any design decisions or bugs found. Use the existing entries as a template.
 2. **`docs/TODO.md`** — Update the status checklist (✅/🔄/⬜/❌) to reflect completed or newly discovered work.
 3. If you change a protocol message type, update **both** `bridge-server/index.js` and `ui/lib/protocol.ts`.
+4. **Document version and changelog** — When editing any document (e.g. under `docs/`, or any `.md` file): add a version line at the top (e.g. `Version: 1`) if absent, or increment the existing version; and append a changelog entry at the end of the document with the new version number, date, and a short description of the change.
 
 ---
 
@@ -244,3 +247,11 @@ Before deploying to a real device, the following must pass:
 - Implementation history: [docs/IMPLEMENTATION_LOG.md](docs/IMPLEMENTATION_LOG.md)
 - Status checklist: [docs/TODO.md](docs/TODO.md)
 - Test procedures: [docs/TEST_PROCEDURES.md](docs/TEST_PROCEDURES.md)
+
+---
+
+## Changelog
+
+| Version | Date | Change |
+|---------|------|--------|
+| 1 | 2025-03-10 | Initial version. Added rule: document version + changelog when editing any doc (item 4 under What to document). |
