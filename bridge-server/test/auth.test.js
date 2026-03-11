@@ -48,6 +48,13 @@ describe('auth.validateAuthenticate', () => {
     assert.equal(result.ok, false);
   });
 
+  it('rejects short wsAuth without throwing', () => {
+    const payload = makeValidPayload({ wsAuth: 'short' });
+    const result = auth.validateAuthenticate(payload, TOKEN, SECRET);
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'hmac_mismatch');
+  });
+
   it('rejects wrong client secret', () => {
     const payload = makeValidPayload({ clientSecret: 'wrong-secret' });
     const result = auth.validateAuthenticate(payload, TOKEN, SECRET);

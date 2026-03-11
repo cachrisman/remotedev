@@ -25,5 +25,8 @@
   },
   "devDependencies": {
     "pm2": "^6.0.14"
+  },
+  "overrides": {
+    "tar": "7.5.11"
   }
 }

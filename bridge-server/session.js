@@ -152,6 +152,7 @@ class Session {
 
     this.ws = null;
     this.proc = null;
+    this.procExited = true;
     this.caffeinateProc = null;
 
     // Sequencing
@@ -186,6 +187,7 @@ class Session {
     this.orphanTimer = null;
     this.backpressureStallTimer = null;
     this.backpressurePausedAt = null;
+    this.backpressureWarned = false;
     this.disconnectedApprovalTimer = null;
     this.dbFlushInterval = null;
     this.drainInterval = null;
@@ -229,6 +231,7 @@ class Session {
     clearTimeout(this.backpressureStallTimer);
     this.backpressureStallTimer = null;
     this.backpressurePausedAt = null;
+    this.backpressureWarned = false;
     clearInterval(this.drainInterval);
     this.drainInterval = null;
 
@@ -271,10 +274,7 @@ class Session {
 
     this.ws = newWs;
 
-    const procAlive = this.proc &&
-      this.proc.exitCode === null &&
-      this.proc.signalCode === null &&
-      !this.proc.killed;
+    const procAlive = !!this.proc && !this.procExited;
 
     // Restore from preDisconnectState
     if (this.preDisconnectState === 'AWAITING_APPROVAL' && this.pendingApproval) {
@@ -370,6 +370,7 @@ class Session {
     }
 
     this.proc = proc;
+    this.procExited = false;
     this._isPty = isPty;
     this.state = 'RUNNING';
     db.updateSessionState(this.id, 'RUNNING');
@@ -402,6 +403,7 @@ class Session {
       });
       this.proc.onExit(({ exitCode, signal }) => {
         if (this.destroyed) return;
+        this.procExited = true;
         logger.info({ sessionId: this.id, code: exitCode, signal }, 'Claude process closed');
         this._framer.flush();
         this.endSession(`proc_exit:${exitCode ?? signal ?? 'unknown'}`);
@@ -426,12 +428,14 @@ class Session {
       });
       this.proc.on('close', (code, signal) => {
         if (this.destroyed) return;
+        this.procExited = true;
         logger.info({ sessionId: this.id, code, signal }, 'Claude process closed');
         this._framer.flush();
         this.endSession(`proc_exit:${code ?? signal ?? 'unknown'}`);
       });
       this.proc.on('error', (err) => {
         if (this.destroyed) return;
+        this.procExited = true;
         logger.error({ sessionId: this.id, err }, 'Claude process error');
         this.endSession('proc_error');
       });
@@ -443,6 +447,7 @@ class Session {
 
   _onNdjsonLine(line) {
     if (this.destroyed) return;
+    if (this.state === 'DISCONNECTED') this._resetOrphanTimer();
 
     if (!this._firstNdjsonLineLogged) {
       this._firstNdjsonLineLogged = true;
@@ -551,6 +556,8 @@ class Session {
   handleApprovalResponse(requestId, decision) {
     if (this.destroyed) return;
     if (!this.pendingApproval) return;
+    if (requestId !== this.pendingApproval.requestId) return;
+    if (decision !== 'approve' && decision !== 'deny') return;
     if (this.lastRespondedRequestId === requestId) return; // exactly-once
 
     this.lastRespondedRequestId = requestId;
@@ -624,9 +631,20 @@ class Session {
       if (!this.persistenceDegraded) {
         const rows = db.getTranscriptTail(this.id);
         for (const row of rows) {
+          let chunkPayload;
+          try {
+            chunkPayload = JSON.parse(row.data);
+          } catch {
+            if (row.type === 'raw_stdout') {
+              chunkPayload = { type: 'raw_stdout', text: String(row.data) };
+            } else {
+              logger.warn({ sessionId: this.id, seq: row.seq, type: row.type }, 'Skipping non-JSON transcript row during replay');
+              continue;
+            }
+          }
           this._send(this._buildEnvelope({
             type: 'transcript_chunk',
-            payload: JSON.parse(row.data),
+            payload: chunkPayload,
           }));
         }
         this._send(this._buildEnvelope({
@@ -686,18 +704,35 @@ class Session {
     if (this.ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
       if (!this.backpressurePausedAt) {
         this.backpressurePausedAt = Date.now();
+        this.backpressureWarned = false;
         this._startBackpressureTimers();
       }
       // Drop this message from live stream; it's in ring/SQLite
       return;
     }
 
+    // Backpressure recovered; clear stall tracking.
+    if (this.backpressurePausedAt) {
+      this.backpressurePausedAt = null;
+      this.backpressureWarned = false;
+      clearTimeout(this.backpressureStallTimer);
+      this.backpressureStallTimer = null;
+    }
+
     this._send(event);
   }
 
   _startBackpressureTimers() {
+    clearTimeout(this.backpressureStallTimer);
     this.backpressureStallTimer = setTimeout(() => {
       if (this.destroyed) return;
+      if (!this.backpressurePausedAt) return;
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.ws.bufferedAmount <= BACKPRESSURE_THRESHOLD) {
+        this.backpressurePausedAt = null;
+        this.backpressureWarned = false;
+        this.backpressureStallTimer = null;
+        return;
+      }
       const pausedMs = Date.now() - (this.backpressurePausedAt || 0);
 
       if (pausedMs >= BACKPRESSURE_KILL_MS) {
@@ -711,15 +746,31 @@ class Session {
         }
         // Session stays RUNNING; client reconnects via gap recovery
       } else if (pausedMs >= BACKPRESSURE_WARN_MS) {
-        this._send(this._buildEnvelope({
-          type: 'bridge_warning',
-          payload: { subtype: 'client_slow', pausedMs },
-        }));
+        if (!this.backpressureWarned) {
+          this.backpressureWarned = true;
+          this._send(this._buildEnvelope({
+            type: 'bridge_warning',
+            payload: { subtype: 'client_slow', pausedMs },
+          }));
+        }
 
         // Check again at kill threshold
         this.backpressureStallTimer = setTimeout(() => {
-          this._startBackpressureTimers();
-        }, BACKPRESSURE_KILL_MS - pausedMs);
+          if (this.destroyed || !this.backpressurePausedAt) return;
+          if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.ws.bufferedAmount <= BACKPRESSURE_THRESHOLD) {
+            this.backpressurePausedAt = null;
+            this.backpressureWarned = false;
+            this.backpressureStallTimer = null;
+            return;
+          }
+          const totalPausedMs = Date.now() - this.backpressurePausedAt;
+          if (totalPausedMs >= BACKPRESSURE_KILL_MS) {
+            logger.warn({ sessionId: this.id }, 'Backpressure 60s: closing WS (session stays RUNNING)');
+            clearTimeout(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+            if (this.ws) this.ws.close(1011, 'buffer_overflow');
+          }
+        }, Math.max(1, BACKPRESSURE_KILL_MS - pausedMs));
       }
     }, BACKPRESSURE_WARN_MS);
   }
@@ -836,6 +887,7 @@ class Session {
   endSession(reason) {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.procExited = true;
 
     logger.info({ sessionId: this.id, reason }, 'Ending session');
 

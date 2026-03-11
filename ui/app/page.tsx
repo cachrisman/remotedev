@@ -96,7 +96,12 @@ function reducer(state: AppState, action: AppAction): AppState {
       if (state.warnings.includes(action.subtype)) return state;
       return { ...state, warnings: [...state.warnings, action.subtype] };
     case 'DISMISS_WARNING':
-      return { ...state, warnings: state.warnings.filter(w => w !== action.subtype) };
+      return {
+        ...state,
+        warnings: state.warnings.filter(w => w !== action.subtype),
+        parseDegraded: action.subtype === 'parse_degraded' ? false : state.parseDegraded,
+        persistenceDegraded: action.subtype === 'persistence_degraded' ? false : state.persistenceDegraded,
+      };
     case 'SET_APPROVAL':
       return { ...state, pendingApproval: action.approval };
     case 'CLEAR_MESSAGES':
@@ -157,6 +162,7 @@ export default function Home() {
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const rootMessageIdRef = useRef<string | null>(null);
+  const stateRef = useRef<AppState>(initialState);
 
   // Runtime config fetched from token endpoint (allowedRoots, bridgeWsUrl)
   const [allowedRoots, setAllowedRoots] = useState<string[]>([]);
@@ -174,6 +180,10 @@ export default function Home() {
 
   // Stable ref to send so callbacks defined before useWebSocket can call it
   const sendRef = useRef<UseWebSocketReturn['send'] | null>(null);
+
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   // Fetch runtime config once on mount (allowedRoots for project picker)
   useEffect(() => {
@@ -276,17 +286,18 @@ export default function Home() {
   ) => {
     sendRef.current?.({
       type: 'client_error',
-      sessionId: state.sessionId,
+      sessionId: stateRef.current.sessionId,
       payload: { rootMessageId, error, context, uiBuildVersion: UI_BUILD_VERSION },
     } as Parameters<NonNullable<typeof sendRef.current>>[0]);
-  }, [state.sessionId]);
+  }, []);
 
   const handleMessage = useCallback((msg: BridgeMsg) => {
+    const currentState = stateRef.current;
     try {
       switch (msg.type) {
         case 'authenticated': {
           sendRef.current?.({ type: 'list_projects', payload: {} } as Parameters<NonNullable<typeof sendRef.current>>[0]);
-          if (!state.sessionId) {
+          if (!currentState.sessionId) {
             const dir = selectedWorkingDirRef.current;
             if (dir !== null) {
               sendRef.current?.({
@@ -312,15 +323,15 @@ export default function Home() {
           if (payload.projects !== undefined || payload.activeProjectPath !== undefined || payload.chats !== undefined || payload.activeChatId !== undefined || payload.currentBranch !== undefined) {
             dispatch({
               type: 'SET_PROJECTS',
-              projects: payload.projects ?? state.projects,
+              projects: payload.projects ?? currentState.projects,
               activeProjectPath: payload.activeProjectPath ?? null,
-              chats: payload.chats ?? state.chats,
+              chats: payload.chats ?? currentState.chats,
               activeChatId: payload.activeChatId ?? null,
               currentBranch: payload.currentBranch ?? null,
             });
             dispatch({ type: 'SET_ADD_PROJECT_ERROR', error: null });
           }
-          const pending = state.pendingGatingAction;
+          const pending = currentState.pendingGatingAction;
           if (pending && payload.activeChatId !== undefined && pending.type === 'switch_chat' && payload.activeChatId === pending.chatId) {
             dispatch({ type: 'SET_PENDING_GATING_ACTION', action: null });
           }
@@ -329,7 +340,7 @@ export default function Home() {
           }
           if (payload.state !== undefined) {
             const sid = msg.sessionId ?? (payload.sessionId as string | undefined);
-            if (sid && !state.sessionId) {
+            if (sid && !currentState.sessionId) {
               dispatch({ type: 'SET_SESSION', sessionId: sid, state: payload.state });
             } else {
               dispatch({
@@ -366,7 +377,7 @@ export default function Home() {
         case 'remediate_result': {
           const p = msg.payload as Record<string, unknown>;
           if (p?.safe === true) {
-            const action = state.pendingGatingAction;
+            const action = currentState.pendingGatingAction;
             dispatch({ type: 'SET_GATING', payload: null });
             dispatch({ type: 'SET_PENDING_GATING_ACTION', action: null });
             if (action?.type === 'switch_chat') {
@@ -495,7 +506,7 @@ export default function Home() {
     } catch (err) {
       sendClientError(String(err), `message_handler_${msg.type}`, msg.rootMessageId);
     }
-  }, [state.sessionId, sendClientError]);
+  }, [sendClientError]);
 
   const { connectionState, send, controllerEpoch } = useWebSocket({
     onMessage: handleMessage,
