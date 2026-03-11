@@ -1,6 +1,6 @@
 {
   "name": "remotedev",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "description": "Control your Mac dev environment from your iPhone via a mobile chat interface",
   "private": true,
   "workspaces": [

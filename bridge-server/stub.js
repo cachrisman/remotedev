@@ -4,7 +4,8 @@
  * Bridge stub — emits canned sequences for Phase 2 parallel UI development.
  *
  * Simulates the bridge server without requiring a real claude process.
- * Supports: auth, create_session, input (canned responses), approval flow, stop.
+ * Supports: auth, create_session, input (canned responses), approval flow, stop;
+ * Chat-Branch Policy: list_projects, add_project, select_project, list_chats, create_chat, switch_chat, archive_chat, switch_branch, remediate.
  *
  * Usage:
  *   BRIDGE_AUTH_TOKEN=test REMOTEDEV_CLIENT_SECRET=test node bridge-server/stub.js
@@ -25,6 +26,12 @@ const PROTOCOL_VERSION = 1;
 
 let seq = 0;
 function nextSeq() { return ++seq; }
+
+const stubProjects = [];
+let stubActiveProjectPath = null;
+const stubChats = [];
+let stubActiveChatId = null;
+let stubCurrentBranch = 'main';
 
 function buildMsg(type, sessionId, payload, extraFields = {}) {
   return {
@@ -190,10 +197,105 @@ wss.on('connection', (ws, req) => {
     }
 
     switch (msg.type) {
+      case 'list_projects': {
+        send(ws, buildMsg('state_sync', sessionId, {
+          projects: stubProjects.map(p => ({ project_path: p, created_at: Date.now(), last_used_at: Date.now() })),
+          activeProjectPath: stubActiveProjectPath,
+          chats: stubChats.filter(c => c.projectPath === stubActiveProjectPath).map(c => ({ id: c.id, name: c.name, current_branch: c.currentBranch, chat_status: c.chatStatus })),
+          activeChatId: stubActiveChatId,
+          currentBranch: stubCurrentBranch,
+        }));
+        break;
+      }
+      case 'add_project': {
+        const projectPath = msg.payload?.projectPath;
+        if (projectPath && !stubProjects.includes(projectPath)) stubProjects.push(projectPath);
+        send(ws, buildMsg('state_sync', sessionId, {
+          projects: stubProjects.map(p => ({ project_path: p, created_at: Date.now(), last_used_at: Date.now() })),
+          activeProjectPath: stubActiveProjectPath,
+        }));
+        break;
+      }
+      case 'select_project': {
+        stubActiveProjectPath = msg.payload?.projectPath || null;
+        const chatsForProject = stubChats.filter(c => c.projectPath === stubActiveProjectPath);
+        send(ws, buildMsg('state_sync', sessionId, {
+          projects: stubProjects.map(p => ({ project_path: p, created_at: Date.now(), last_used_at: Date.now() })),
+          activeProjectPath: stubActiveProjectPath,
+          chats: chatsForProject.map(c => ({ id: c.id, name: c.name, current_branch: c.currentBranch, chat_status: c.chatStatus })),
+          activeChatId: stubActiveChatId && chatsForProject.some(c => c.id === stubActiveChatId) ? stubActiveChatId : null,
+        }));
+        break;
+      }
+      case 'list_chats': {
+        const pp = msg.payload?.projectPath || stubActiveProjectPath;
+        const chats = stubChats.filter(c => c.projectPath === pp).map(c => ({ id: c.id, name: c.name, current_branch: c.currentBranch, chat_status: c.chatStatus }));
+        send(ws, buildMsg('state_sync', sessionId, { projects: stubProjects.map(p => ({ project_path: p, created_at: Date.now(), last_used_at: null })), activeProjectPath: stubActiveProjectPath, chats }));
+        break;
+      }
+      case 'create_chat': {
+        const projectPath = msg.payload?.projectPath || stubActiveProjectPath;
+        const name = (msg.payload?.name || 'chat').trim().slice(0, 40);
+        sessionId = crypto.randomUUID();
+        stubActiveChatId = sessionId;
+        const branch = 'chat/' + Date.now().toString(36) + '-' + name.slice(0, 8);
+        stubChats.push({ id: sessionId, name, projectPath, currentBranch: branch, chatStatus: 'ACTIVE' });
+        stubCurrentBranch = branch;
+        send(ws, buildMsg('state_sync', sessionId, {
+          state: 'IDLE', sessionId, seq: nextSeq(), lastAck: 0,
+          activeChatId: sessionId, currentBranch: branch,
+          projects: stubProjects.map(p => ({ project_path: p, created_at: Date.now(), last_used_at: Date.now() })),
+          activeProjectPath: stubActiveProjectPath,
+          chats: stubChats.filter(c => c.projectPath === stubActiveProjectPath).map(c => ({ id: c.id, name: c.name, current_branch: c.currentBranch, chat_status: c.chatStatus })),
+        }));
+        console.log('[stub] Chat created:', sessionId);
+        break;
+      }
+      case 'switch_chat': {
+        const chatId = msg.payload?.chatId;
+        const chat = stubChats.find(c => c.id === chatId);
+        if (chat) {
+          sessionId = chatId;
+          stubActiveChatId = chatId;
+          stubCurrentBranch = chat.currentBranch;
+        }
+        send(ws, buildMsg('state_sync', sessionId, {
+          state: 'IDLE', sessionId, seq: nextSeq(), lastAck: 0,
+          activeChatId: stubActiveChatId, currentBranch: stubCurrentBranch,
+          projects: stubProjects.map(p => ({ project_path: p, created_at: Date.now(), last_used_at: null })),
+          activeProjectPath: stubActiveProjectPath,
+          chats: stubChats.filter(c => c.projectPath === stubActiveProjectPath).map(c => ({ id: c.id, name: c.name, current_branch: c.currentBranch, chat_status: c.chatStatus })),
+        }));
+        break;
+      }
+      case 'switch_branch': {
+        const branchName = msg.payload?.branchName;
+        if (branchName) stubCurrentBranch = branchName;
+        const chat = stubChats.find(c => c.id === sessionId);
+        if (chat) chat.currentBranch = stubCurrentBranch;
+        send(ws, buildMsg('state_sync', sessionId, { state: 'IDLE', sessionId, seq: nextSeq(), currentBranch: stubCurrentBranch }));
+        break;
+      }
+      case 'archive_chat': {
+        const chatId = msg.payload?.chatId;
+        const c = stubChats.find(x => x.id === chatId);
+        if (c) c.chatStatus = 'ARCHIVED';
+        if (stubActiveChatId === chatId) stubActiveChatId = null;
+        send(ws, buildMsg('state_sync', sessionId, {
+          activeChatId: stubActiveChatId,
+          chats: stubChats.filter(x => x.projectPath === stubActiveProjectPath && x.chatStatus !== 'ARCHIVED').map(x => ({ id: x.id, name: x.name, current_branch: x.currentBranch, chat_status: x.chatStatus })),
+        }));
+        break;
+      }
+      case 'remediate': {
+        const chatId = msg.payload?.chatId;
+        send(ws, buildMsg('remediate_result', chatId, { safe: true, stagedCount: 0, unstagedCount: 0, untrackedCount: 0, truncated: false }));
+        break;
+      }
       case 'create_session': {
         sessionId = crypto.randomUUID();
         send(ws, buildMsg('state_sync', sessionId, {
-          state: 'IDLE', sessionId, seq: 0, lastAck: 0,
+          state: 'IDLE', sessionId, seq: nextSeq(), lastAck: 0,
         }));
         console.log('[stub] Session created:', sessionId);
         break;

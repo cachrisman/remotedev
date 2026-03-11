@@ -15,8 +15,8 @@ class SessionManager {
   #currentEpoch = null;
   #controllerSessionId = null;
 
-  create(SessionClass, id, name, workingDir) {
-    const s = new SessionClass(id, name, workingDir);
+  create(SessionClass, id, name, workingDir, opts) {
+    const s = new SessionClass(id, name, workingDir, opts);
     this.#sessions.set(id, s);
     return s;
   }

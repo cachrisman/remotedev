@@ -785,4 +785,127 @@ Added `getClaudePath()` to `startup-checks.js` (exported). Returns `process.env.
 
 ---
 
+---
+
+## Chat-Branch Policy (v0.17)
+
+**Implementation:** Branch-only isolation per `docs/CHAT_BRANCH_POLICY.md`.
+
+### DB schema and migrations
+
+- **schema_version** table (single row); version 2 after migration.
+- **projects** table: `project_path`, `created_at`, `last_used_at`.
+- **sessions** extended with: `project_path`, `chat_status` (ACTIVE | RUNNING | PAUSED | ARCHIVED), `primary_branch`, `current_branch`, `last_activity_at`, `paused_at`, `archived_at`, `checkpoint_type`, `checkpoint_ref`, `checkpoint_at`.
+- Migration backfills existing sessions with `chat_status = 'ACTIVE'` and `project_path = working_dir`.
+- **audit_log**: project-level events use synthetic `session_id` (e.g. `__project__:<path>`) so `session_id` remains NOT NULL.
+
+### git.js
+
+- **getRepoStatus(workingDir)**: `git rev-parse --is-inside-work-tree`, `--abbrev-ref HEAD`, `diff --name-only`, `diff --cached --name-only`, `ls-files --others --exclude-standard`; returns `isGitRepo`, `currentBranch`, `hasStaged`, `hasUnstaged`, `untrackedNotIgnoredFiles`, etc.
+- **assertSafeOrReturnDetails(workingDir)**: Safe iff no staged, unstaged, or untracked-not-ignored; returns counts and capped file lists with `truncated` when over cap.
+- **commitAll**, **stashAll**, **discardAll**: remediation; discardAll does `reset --hard` then deletes only untracked-not-ignored paths under repo root (no `git clean`).
+- **isRiskyForCheckpoint**: sensitive patterns (e.g. `.env`, `*.pem`) or file count over threshold → prefer stash over commit for idle checkpoint.
+
+### Project path validation
+
+- **validateProjectPath(rawPath, resolvedRoots)** in path-validator.js: path must exist and be a directory; realpath; under one of resolvedRoots; `git rev-parse --is-inside-work-tree` in that dir. Returns `PATH_NOT_FOUND` | `NOT_WITHIN_ALLOWED_ROOTS` | `NOT_A_GIT_REPO` or `{ safe: true, resolvedPath }`. No ancestor walk for add_project.
+
+### WS messages (bridge index.js)
+
+- **list_projects** / **list_chats**: not epoch-gated; return projects or chats for project.
+- **add_project**, **select_project**, **create_chat**, **switch_chat**, **switch_branch**, **archive_chat**, **remediate**: epoch-gated.
+- **create_chat**: safe-state check first (gating_required if dirty); validateProjectPath; create branch `chat/YYYYMMDD/shortId-slug`; insert session with chat fields; Session created with skipDbInsert.
+- **switch_chat** / **switch_branch**: lease check (branch leased by another ACTIVE/RUNNING chat in same project); safe-state check; gating_required if not safe; after remediate, server re-runs assertSafeOrReturnDetails and sends **remediate_result**; UI retries switch only if safe.
+- **remediate**: workingDir from chat.project_path; commitAll/stashAll/discardAll; then remediate_result with post-remediate safe state.
+
+### Idle timeout and checkpoint
+
+- **idle-checkpoint.js**: every 5 minutes, for in-memory sessions that are IDLE, chat_status ACTIVE, and `last_activity_at` > 12h ago, run **checkpoint(chatId)** (commit or stash, update DB, set chat_status PAUSED); checkpoint only when execution state is IDLE.
+- **session.js**: on startClaude set chat_status RUNNING and last_activity_at; on endSession set chat_status ACTIVE unless already PAUSED/ARCHIVED.
+
+### UI
+
+- **protocol.ts**: StateSyncPayload extended with projects, activeProjectPath, activeChatId, currentBranch, chats; GatingRequiredPayload, RemediateResultPayload.
+- **page.tsx**: list_projects on authenticated; project list and Add project (path input); select_project; chats list and New chat (create_chat); switch_chat; gating modal (Commit/Stash/Discard, discard with second confirmation); remediate then retry on remediate_result.safe; currentBranch in header; Switch branch modal. Single allowed root retains legacy create_session flow.
+
+### Bug fix
+
+- **listChatsByProject(projectPath)** was calling `.all()` without passing `projectPath`; fixed to `.all(projectPath)`.
+
+---
+
+### Post-implementation feedback (Chat-Branch Policy)
+
+The following rounds of review led to targeted fixes before merge.
+
+#### Round 1: UX and gating correctness
+
+**Feedback:**
+
+1. **Projects/chats UI hidden once session exists** — With `showProjectsAndChats = ... && !state.sessionId`, after entering a chat the user could no longer see the chat list or switch chats.
+2. **gating_required chatId inference dangerous** — UI used `msg.sessionId || p?.chatId` for remediate. For create_chat (no chat yet) the server sends `gating_required` with null sessionId; if envelope sessionId was the current session, UI could remediate the wrong repo.
+3. **pendingGatingAction cleared too aggressively** — Clearing on any `state_sync` with `payload.state` could race: state_sync arrives before remediate_result, pending action cleared, then no retry after user remediates.
+4. **state_sync.state optional** — Ensure all consumers tolerate missing `state` (projects-only syncs omit it).
+5. **Stub seq** — create_session/create_chat used `seq: 0`; use nextSeq() for monotonic seq per connection.
+6. **Error handling** — Add-project errors: accept `subtype` or `code` or `reason` from bridge.
+
+**Changes:**
+
+- **UI:** Added `showProjectsChatsView` so projects/chats list is reachable when a session exists. Header "Chats" / "Back to chat" toggles the view; "Back to chat" in the panel when in session. `showProjectsAndChats` is true when multi-root and (no session OR `showProjectsChatsView`). Close Chats view when state_sync carries sessionId/activeChatId (successful switch).
+- **UI:** gating_required: use only **payload.chatId** (never envelope sessionId). `chatId: (p?.chatId as string | undefined) ?? null`. create_chat gating shows "Commit or stash in your repo, then try again" and only Cancel when chatId is null.
+- **Bridge:** Include **chatId in gating_required payload** for switch_chat and switch_branch so UI has an explicit value; create_chat omits it (null).
+- **UI:** Clear **pendingGatingAction** only when state_sync **confirms** the switch: `payload.activeChatId === pending.chatId` (switch_chat) or `payload.currentBranch === pending.branchName` (switch_branch). Removed clear on generic state_sync with state.
+- **protocol.ts:** Comment that `state` is optional (projects-only syncs omit it); consumers must guard.
+- **Stub:** create_session and create_chat use `nextSeq()` instead of `seq: 0`.
+- **UI:** Add-project error code from `msg.payload?.subtype ?? msg.payload?.code ?? msg.payload?.reason`.
+
+#### Round 2: pendingGatingAction race, envelope safety, branch format
+
+**Feedback:**
+
+1. **pendingGatingAction still cleared too aggressively** — Clearing when `payload.sessionId !== undefined || payload.activeChatId !== undefined` could clear on an unrelated state_sync (e.g. list_chats response that includes activeChatId), so after remediate the UI had no action to retry.
+2. **gating_required envelope sessionId** — When activeChatId is null (e.g. gating before any chat), buildMsg('gating_required', activeChatId, ...) could pass null; ensure envelope is always a string or buildMsg tolerates null.
+3. **StateSyncPayload.state optional** — Consider bridge always including state when it matters, or keep optional and document (already done).
+4. **Centralize gating_required** — Single helper so all producers send the same payload shape (chatId, counts, lists, truncated).
+
+**Changes:**
+
+- **UI:** Clear pendingGatingAction **only when state_sync confirms the target**: `pending.type === 'switch_chat' && payload.activeChatId === pending.chatId`, or `pending.type === 'switch_branch' && payload.currentBranch === pending.branchName`. No clear on generic sessionId/activeChatId presence.
+- **Bridge:** Added **sendGatingRequired(ws, connectionState, chatId, safeCheck)**. Envelope sessionId = `typeof chatId === 'string' ? chatId : (typeof connectionState.sessionId === 'string' ? connectionState.sessionId : '__bridge__')` so it is always a string. Payload built in one place (chatId, counts, file lists, truncated). All three call sites (switch_chat, switch_branch, create_chat) use the helper.
+- **Bridge:** create_chat gating now calls sendGatingRequired(ws, connectionState, null, safeCheck); envelope uses __bridge__ when no session.
+
+#### Round 3: envelope sentinel, branch normalization, remediate failure UX
+
+**Feedback:**
+
+1. **sendGatingRequired envelope** — Use explicit typeof checks: envelope sessionId string via chatId or connectionState.sessionId or sentinel; document that __bridge__ is only for gating_required and UI ignores envelope (uses payload.chatId).
+2. **Branch name format** — Server might return `refs/heads/foo`, `origin/foo`, or `refs/remotes/origin/foo`; UI comparison could miss and never clear pendingGatingAction.
+3. **remediate_result when safe=false** — Surface failure (e.g. commit failed, still dirty) so the user sees updated counts or a message instead of "nothing happened."
+4. **Dead code** — retryAfterRemediate was unused (remediate_result does retry inline); remove it.
+
+**Changes:**
+
+- **Bridge:** Envelope in sendGatingRequired: `typeof chatId === 'string' ? chatId : (typeof connectionState.sessionId === 'string' ? connectionState.sessionId : '__bridge__')`. Comment that envelope is for routing only; UI uses payload.chatId only.
+- **UI:** **normalizeBranch(branch)** strips `refs/heads/`, `refs/remotes/origin/`, and `origin/`. "Switch succeeded" check uses `normalizeBranch(payload.currentBranch) === normalizeBranch(pending.branchName)`.
+- **UI:** On remediate_result with safe !== true: keep gating modal open; **update gatingRequired** with counts/lists from payload and set **remediateError** (payload.message || payload.reason || default). Modal shows remediateError in amber. Type extended with remediateError.
+- **UI:** Removed **retryAfterRemediate** callback.
+
+#### Round 4: payload chatId type, stale state, normalization completeness
+
+**Feedback:**
+
+1. **Bridge payload chatId** — Use `typeof chatId === 'string' ? chatId : null` instead of `chatId ?? null` so a non-string never slips through and UI never tries to remediate with a bad id.
+2. **UI remediate failure and stale state** — The else branch used `state.gatingRequired` from closure; React state can be stale between send and remediate_result, so we could overwrite with old data or drop the update. Prefer building the failure payload from the message/payload only (server already echoes file lists in remediate_result when safe=false).
+3. **normalizeBranch** — Also strip `refs/remotes/origin/` and `origin/` so tracking-branch formats match.
+4. **__bridge__ sentinel** — Confirm no code assumes sessionId is UUID; document that sentinel is only for gating_required envelope.
+
+**Changes:**
+
+- **Bridge:** In sendGatingRequired payload, **chatId: typeof chatId === 'string' ? chatId : null**.
+- **Bridge:** Comment on sendGatingRequired clarified: envelope sessionId is for routing only; UI uses payload.chatId only; __bridge__ is the sentinel when no chat/session.
+- **UI:** remediate_result failure path **no longer uses state.gatingRequired**. Build payload from **msg and p only**: chatId from `msg.sessionId ?? p?.chatId` (then typeof check), counts and file lists from p (bridge already sends ...after on failure). remediateError unchanged. Avoids closure staleness.
+- **UI:** normalizeBranch already stripped refs/heads/; added **.replace(/^refs\/remotes\/origin\//, '').replace(/^origin\//, '')**. No UUID-style checks on sessionId found in bridge; __bridge__ only used as envelope for gating_required.
+
+---
+
 *For the original specification, see `docs/PLAN.md`. For operational procedures, see `docs/USER_GUIDE.md`. For what to do next, see `docs/TODO.md`.*

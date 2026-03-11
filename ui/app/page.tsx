@@ -15,8 +15,32 @@ import {
 const UI_BUILD_VERSION = process.env.UI_BUILD_VERSION || 'unknown';
 const DEFAULT_SESSION_NAME = 'main';
 
+/** Normalize branch name for comparison (strip refs/heads/, refs/remotes/origin/, origin/ so UI and server formats match). */
+function normalizeBranch(branch: string | undefined | null): string {
+  if (branch == null || typeof branch !== 'string') return '';
+  return branch
+    .replace(/^refs\/heads\//, '')
+    .replace(/^refs\/remotes\/origin\//, '')
+    .replace(/^origin\//, '');
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // State
+
+interface ProjectInfo {
+  project_path: string;
+  created_at?: number;
+  last_used_at?: number | null;
+}
+
+interface ChatInfo {
+  id: string;
+  name?: string;
+  chat_status?: string;
+  primary_branch?: string;
+  current_branch?: string;
+  created_at?: number;
+}
 
 interface AppState {
   sessionId: string | null;
@@ -26,18 +50,31 @@ interface AppState {
   pendingApproval: PendingApproval | null;
   parseDegraded: boolean;
   persistenceDegraded: boolean;
+  projects: ProjectInfo[];
+  activeProjectPath: string | null;
+  chats: ChatInfo[];
+  activeChatId: string | null;
+  currentBranch: string | null;
+  gatingRequired: { chatId: string | null; stagedCount: number; unstagedCount: number; untrackedCount: number; stagedFiles?: string[]; unstagedFiles?: string[]; untrackedNotIgnoredFiles?: string[]; truncated?: boolean; remediateError?: string } | null;
+  /** Set when we send switch_chat/switch_branch so we can retry after remediate */
+  pendingGatingAction: { type: 'switch_chat'; chatId: string } | { type: 'switch_branch'; branchName: string } | null;
+  addProjectError: string | null;
 }
 
 type AppAction =
   | { type: 'SET_SESSION'; sessionId: string; state: SessionInfo['state'] }
   | { type: 'CLEAR_SESSION' }
   | { type: 'SET_STATE'; state: SessionInfo['state']; pendingApproval?: PendingApproval | null }
+  | { type: 'SET_PROJECTS'; projects: ProjectInfo[]; activeProjectPath?: string | null; chats?: ChatInfo[]; activeChatId?: string | null; currentBranch?: string | null }
   | { type: 'ADD_MESSAGE'; entry: ChatEntry }
   | { type: 'ADD_WARNING'; subtype: string }
   | { type: 'DISMISS_WARNING'; subtype: string }
   | { type: 'SET_APPROVAL'; approval: PendingApproval | null }
   | { type: 'CLEAR_MESSAGES' }
-  | { type: 'SET_DEGRADED'; parse?: boolean; persistence?: boolean };
+  | { type: 'SET_DEGRADED'; parse?: boolean; persistence?: boolean }
+  | { type: 'SET_GATING'; payload: AppState['gatingRequired'] }
+  | { type: 'SET_PENDING_GATING_ACTION'; action: AppState['pendingGatingAction'] }
+  | { type: 'SET_ADD_PROJECT_ERROR'; error: string | null };
 
 function reducer(state: AppState, action: AppAction): AppState {
   switch (action.type) {
@@ -70,6 +107,21 @@ function reducer(state: AppState, action: AppAction): AppState {
         parseDegraded: action.parse ?? state.parseDegraded,
         persistenceDegraded: action.persistence ?? state.persistenceDegraded,
       };
+    case 'SET_PROJECTS':
+      return {
+        ...state,
+        projects: action.projects ?? state.projects,
+        activeProjectPath: action.activeProjectPath !== undefined ? action.activeProjectPath : state.activeProjectPath,
+        chats: action.chats !== undefined ? action.chats : state.chats,
+        activeChatId: action.activeChatId !== undefined ? action.activeChatId : state.activeChatId,
+        currentBranch: action.currentBranch !== undefined ? action.currentBranch : state.currentBranch,
+      };
+    case 'SET_GATING':
+      return { ...state, gatingRequired: action.payload };
+    case 'SET_PENDING_GATING_ACTION':
+      return { ...state, pendingGatingAction: action.action };
+    case 'SET_ADD_PROJECT_ERROR':
+      return { ...state, addProjectError: action.error };
     default:
       return state;
   }
@@ -83,6 +135,14 @@ const initialState: AppState = {
   pendingApproval: null,
   parseDegraded: false,
   persistenceDegraded: false,
+  projects: [],
+  activeProjectPath: null,
+  chats: [],
+  activeChatId: null,
+  currentBranch: null,
+  gatingRequired: null,
+  pendingGatingAction: null,
+  addProjectError: null,
 };
 
 function basename(p: string) {
@@ -102,8 +162,15 @@ export default function Home() {
   const [allowedRoots, setAllowedRoots] = useState<string[]>([]);
   const [selectedWorkingDir, setSelectedWorkingDir] = useState<string | null>(null);
   const selectedWorkingDirRef = useRef<string | null>(null);
-  // True once authenticated but project not yet picked (multiple roots case)
   const pendingCreateRef = useRef(false);
+  const [showAddProject, setShowAddProject] = useState(false);
+  const [addProjectPath, setAddProjectPath] = useState('');
+  const [gatingRemediateMessage, setGatingRemediateMessage] = useState('');
+  const [gatingDiscardConfirm, setGatingDiscardConfirm] = useState(false);
+  const [showSwitchBranch, setShowSwitchBranch] = useState(false);
+  const [switchBranchName, setSwitchBranchName] = useState('');
+  /** When true, show projects/chats list even when a session is active (so user can switch chat). */
+  const [showProjectsChatsView, setShowProjectsChatsView] = useState(false);
 
   // Stable ref to send so callbacks defined before useWebSocket can call it
   const sendRef = useRef<UseWebSocketReturn['send'] | null>(null);
@@ -142,6 +209,66 @@ export default function Home() {
     });
   }, []);
 
+  const handleSelectProject = useCallback((projectPath: string) => {
+    sendRef.current?.({
+      type: 'select_project',
+      payload: { projectPath },
+    } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+  }, []);
+
+  const handleAddProject = useCallback(() => {
+    const path = addProjectPath.trim();
+    if (!path) return;
+    dispatch({ type: 'SET_ADD_PROJECT_ERROR', error: null });
+    sendRef.current?.({
+      type: 'add_project',
+      payload: { projectPath: path },
+    } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+    setAddProjectPath('');
+    setShowAddProject(false);
+  }, [addProjectPath]);
+
+  const handleCreateChat = useCallback(() => {
+    const projectPath = state.activeProjectPath;
+    if (!projectPath) return;
+    sendRef.current?.({
+      type: 'create_chat',
+      payload: { projectPath, name: 'New chat' },
+    } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+  }, [state.activeProjectPath]);
+
+  const handleSwitchChat = useCallback((chatId: string) => {
+    dispatch({ type: 'SET_PENDING_GATING_ACTION', action: { type: 'switch_chat', chatId } });
+    sendRef.current?.({
+      type: 'switch_chat',
+      payload: { chatId },
+    } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+  }, []);
+
+  const handleSwitchBranch = useCallback((branchName: string) => {
+    dispatch({ type: 'SET_PENDING_GATING_ACTION', action: { type: 'switch_branch', branchName } });
+    sendRef.current?.({
+      type: 'switch_branch',
+      payload: { branchName },
+    } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+  }, []);
+
+  const sendRemediate = useCallback((action: 'commit' | 'stash' | 'discard', message?: string) => {
+    const g = state.gatingRequired;
+    if (!g) return;
+    sendRef.current?.({
+      type: 'remediate',
+      payload: { chatId: g.chatId, action, message: message?.trim() || undefined },
+    } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+  }, [state.gatingRequired]);
+
+  const dismissGating = useCallback(() => {
+    dispatch({ type: 'SET_GATING', payload: null });
+    dispatch({ type: 'SET_PENDING_GATING_ACTION', action: null });
+    setGatingDiscardConfirm(false);
+    setGatingRemediateMessage('');
+  }, []);
+
   const sendClientError = useCallback((
     error: string,
     context: string,
@@ -158,6 +285,7 @@ export default function Home() {
     try {
       switch (msg.type) {
         case 'authenticated': {
+          sendRef.current?.({ type: 'list_projects', payload: {} } as Parameters<NonNullable<typeof sendRef.current>>[0]);
           if (!state.sessionId) {
             const dir = selectedWorkingDirRef.current;
             if (dir !== null) {
@@ -166,7 +294,6 @@ export default function Home() {
                 payload: { name: DEFAULT_SESSION_NAME, workingDir: dir },
               });
             } else {
-              // Multiple roots — wait for user to pick a project
               pendingCreateRef.current = true;
             }
           }
@@ -182,18 +309,88 @@ export default function Home() {
             return;
           }
 
-          if (msg.sessionId && !state.sessionId) {
-            dispatch({ type: 'SET_SESSION', sessionId: msg.sessionId, state: payload.state });
-          } else {
+          if (payload.projects !== undefined || payload.activeProjectPath !== undefined || payload.chats !== undefined || payload.activeChatId !== undefined || payload.currentBranch !== undefined) {
             dispatch({
-              type: 'SET_STATE',
-              state: payload.state,
-              pendingApproval: payload.pendingApproval || null,
+              type: 'SET_PROJECTS',
+              projects: payload.projects ?? state.projects,
+              activeProjectPath: payload.activeProjectPath ?? null,
+              chats: payload.chats ?? state.chats,
+              activeChatId: payload.activeChatId ?? null,
+              currentBranch: payload.currentBranch ?? null,
             });
+            dispatch({ type: 'SET_ADD_PROJECT_ERROR', error: null });
           }
-
+          const pending = state.pendingGatingAction;
+          if (pending && payload.activeChatId !== undefined && pending.type === 'switch_chat' && payload.activeChatId === pending.chatId) {
+            dispatch({ type: 'SET_PENDING_GATING_ACTION', action: null });
+          }
+          if (pending && payload.currentBranch !== undefined && pending.type === 'switch_branch' && normalizeBranch(payload.currentBranch) === normalizeBranch(pending.branchName)) {
+            dispatch({ type: 'SET_PENDING_GATING_ACTION', action: null });
+          }
+          if (payload.state !== undefined) {
+            const sid = msg.sessionId ?? (payload.sessionId as string | undefined);
+            if (sid && !state.sessionId) {
+              dispatch({ type: 'SET_SESSION', sessionId: sid, state: payload.state });
+            } else {
+              dispatch({
+                type: 'SET_STATE',
+                state: payload.state,
+                pendingApproval: payload.pendingApproval || null,
+              });
+            }
+            if (payload.sessionId !== undefined || payload.activeChatId !== undefined) setShowProjectsChatsView(false);
+          }
           if (payload.parseDegraded) dispatch({ type: 'SET_DEGRADED', parse: true });
           if (payload.persistenceDegraded) dispatch({ type: 'SET_DEGRADED', persistence: true });
+          break;
+        }
+
+        case 'gating_required': {
+          const p = msg.payload as Record<string, unknown>;
+          dispatch({
+            type: 'SET_GATING',
+            payload: {
+              chatId: (p?.chatId as string | undefined) ?? null,
+              stagedCount: (p?.stagedCount as number) ?? 0,
+              unstagedCount: (p?.unstagedCount as number) ?? 0,
+              untrackedCount: (p?.untrackedCount as number) ?? 0,
+              stagedFiles: p?.stagedFiles as string[] | undefined,
+              unstagedFiles: p?.unstagedFiles as string[] | undefined,
+              untrackedNotIgnoredFiles: p?.untrackedNotIgnoredFiles as string[] | undefined,
+              truncated: p?.truncated as boolean | undefined,
+            },
+          });
+          break;
+        }
+
+        case 'remediate_result': {
+          const p = msg.payload as Record<string, unknown>;
+          if (p?.safe === true) {
+            const action = state.pendingGatingAction;
+            dispatch({ type: 'SET_GATING', payload: null });
+            dispatch({ type: 'SET_PENDING_GATING_ACTION', action: null });
+            if (action?.type === 'switch_chat') {
+              sendRef.current?.({ type: 'switch_chat', payload: { chatId: action.chatId } } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+            } else if (action?.type === 'switch_branch') {
+              sendRef.current?.({ type: 'switch_branch', payload: { branchName: action.branchName } } as Parameters<NonNullable<typeof sendRef.current>>[0]);
+            }
+          } else {
+            const chatIdFromMsg = (msg.sessionId ?? p?.chatId) as string | undefined;
+            dispatch({
+              type: 'SET_GATING',
+              payload: {
+                chatId: typeof chatIdFromMsg === 'string' ? chatIdFromMsg : null,
+                stagedCount: (p?.stagedCount as number) ?? 0,
+                unstagedCount: (p?.unstagedCount as number) ?? 0,
+                untrackedCount: (p?.untrackedCount as number) ?? 0,
+                stagedFiles: p?.stagedFiles as string[] | undefined,
+                unstagedFiles: p?.unstagedFiles as string[] | undefined,
+                untrackedNotIgnoredFiles: p?.untrackedNotIgnoredFiles as string[] | undefined,
+                truncated: (p?.truncated as boolean) ?? false,
+                remediateError: (p?.message as string) || (p?.reason as string) || 'Still not safe — commit or stash did not clear all changes.',
+              },
+            });
+          }
           break;
         }
 
@@ -274,8 +471,12 @@ export default function Home() {
 
         case 'error': {
           const errMsg = (msg.payload?.message as string) || 'unknown';
+          const errorCode = (msg.payload?.subtype ?? msg.payload?.code ?? msg.payload?.reason) as string | undefined;
+          if (errorCode && ['PATH_NOT_FOUND', 'NOT_WITHIN_ALLOWED_ROOTS', 'NOT_A_GIT_REPO'].includes(errorCode)) {
+            dispatch({ type: 'SET_ADD_PROJECT_ERROR', error: errorCode });
+            break;
+          }
           if (errMsg === 'session_not_found') {
-            // Bridge was restarted (sessions lost) — clear stale session and recreate
             dispatch({ type: 'CLEAR_SESSION' });
             const dir = selectedWorkingDirRef.current ?? '';
             sendRef.current?.({
@@ -373,10 +574,7 @@ export default function Home() {
     DISCONNECTED: 'Reconnecting...',
   }[state.sessionState] ?? state.sessionState;
 
-  // Show project picker when: connected, no session yet, and multiple roots to choose from
-  const showProjectPicker = !state.sessionId && allowedRoots.length > 1 && (
-    connectionState === 'connected' || connectionState === 'authenticating'
-  );
+  const showProjectsAndChats = (connectionState === 'connected' || connectionState === 'authenticating') && allowedRoots.length > 1 && (!state.sessionId || showProjectsChatsView);
 
   return (
     // h-dvh = dynamic viewport height: shrinks/grows as Safari toolbar appears/disappears
@@ -390,16 +588,35 @@ export default function Home() {
             <div className={`w-2 h-2 rounded-full flex-shrink-0 ${statusColor}`} />
             <div className="min-w-0">
               <span className="font-semibold text-sm text-white">RemoteDev</span>
-              {selectedWorkingDir && (
+              {(state.activeProjectPath || selectedWorkingDir) && (
                 <span className="ml-2 text-xs text-gray-500 truncate">
-                  {basename(selectedWorkingDir)}
+                  {basename(state.activeProjectPath || selectedWorkingDir || '')}
                 </span>
+              )}
+              {state.currentBranch && (
+                <button
+                  type="button"
+                  onClick={() => { setSwitchBranchName(state.currentBranch ?? ''); setShowSwitchBranch(true); }}
+                  className="ml-2 text-xs text-blue-400 truncate hover:text-blue-300"
+                  title="Switch branch"
+                >
+                  {state.currentBranch}
+                </button>
               )}
             </div>
           </div>
 
           {/* Right: session state + stop */}
           <div className="flex items-center gap-2 flex-shrink-0">
+            {state.sessionId && allowedRoots.length > 1 && (
+              <button
+                type="button"
+                onClick={() => setShowProjectsChatsView(prev => !prev)}
+                className="text-xs text-blue-400 hover:text-blue-300"
+              >
+                {showProjectsChatsView ? 'Back to chat' : 'Chats'}
+              </button>
+            )}
             <span className="text-xs text-gray-400">{sessionStatus}</span>
             {(state.sessionState === 'RUNNING' || state.sessionState === 'AWAITING_APPROVAL') && (
               <button
@@ -432,25 +649,63 @@ export default function Home() {
           </div>
         ))}
 
-      {/* Messages / project picker */}
+      {/* Messages / projects & chats */}
       <div className="flex-1 overflow-y-auto">
-        {showProjectPicker ? (
-          // Project picker: shown before session creation when multiple roots exist
-          <div className="flex flex-col items-center justify-center h-full gap-3 px-6">
-            <p className="text-gray-300 font-medium text-base">Choose a project</p>
-            <p className="text-gray-500 text-sm text-center">Select the working directory for this session</p>
-            <div className="w-full space-y-2 mt-2">
-              {allowedRoots.map(root => (
+        {showProjectsAndChats ? (
+          <div className="flex flex-col p-4 gap-4">
+            <section>
+              <p className="text-gray-400 text-sm font-medium mb-2">Projects</p>
+              <div className="space-y-1">
+                {state.projects.map(p => (
+                  <button
+                    key={p.project_path}
+                    onClick={() => handleSelectProject(p.project_path)}
+                    className={`w-full text-left px-3 py-2 rounded-lg text-sm ${state.activeProjectPath === p.project_path ? 'bg-blue-900/50 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
+                  >
+                    {basename(p.project_path)}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => setShowAddProject(true)}
+                className="mt-2 text-sm text-blue-400 hover:text-blue-300"
+              >
+                Add project
+              </button>
+              {state.addProjectError && (
+                <p className="mt-1 text-xs text-red-400">{state.addProjectError}</p>
+              )}
+            </section>
+            {state.activeProjectPath && (
+              <section>
+                <p className="text-gray-400 text-sm font-medium mb-2">Chats</p>
+                <div className="space-y-1">
+                  {state.chats.map(c => (
+                    <button
+                      key={c.id}
+                      onClick={() => handleSwitchChat(c.id)}
+                      className={`w-full text-left px-3 py-2 rounded-lg text-sm ${state.activeChatId === c.id ? 'bg-blue-900/50 text-white' : 'bg-gray-800 text-gray-300 hover:bg-gray-700'}`}
+                    >
+                      {c.name || c.id.slice(0, 8)} {c.current_branch && `(${c.current_branch})`}
+                    </button>
+                  ))}
+                </div>
                 <button
-                  key={root}
-                  onClick={() => handlePickProject(root)}
-                  className="w-full bg-gray-800 active:bg-gray-700 px-4 py-3 rounded-xl text-left transition-colors"
+                  onClick={handleCreateChat}
+                  className="mt-2 text-sm text-blue-400 hover:text-blue-300"
                 >
-                  <div className="font-medium text-white text-sm">{basename(root)}</div>
-                  <div className="text-xs text-gray-500 mt-0.5 truncate">{root}</div>
+                  New chat
                 </button>
-              ))}
-            </div>
+                {state.sessionId && (
+                  <button
+                    onClick={() => setShowProjectsChatsView(false)}
+                    className="mt-3 text-sm text-gray-400 hover:text-gray-300"
+                  >
+                    Back to chat
+                  </button>
+                )}
+              </section>
+            )}
           </div>
         ) : (
           <div className="py-4 space-y-1">
@@ -488,14 +743,14 @@ export default function Home() {
                 ? 'Enter an instruction...'
                 : 'Waiting for task to complete...'
             }
-            disabled={state.sessionState !== 'IDLE' || showProjectPicker}
+            disabled={state.sessionState !== 'IDLE' || showProjectsAndChats}
             rows={1}
             className="flex-1 bg-gray-800 border border-gray-700 rounded-xl px-4 py-3 text-white placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500 disabled:opacity-50 min-h-[48px] max-h-40"
             style={{ fieldSizing: 'content' } as React.CSSProperties}
           />
           <button
             onClick={handleSend}
-            disabled={state.sessionState !== 'IDLE' || !input.trim() || showProjectPicker}
+            disabled={state.sessionState !== 'IDLE' || !input.trim() || showProjectsAndChats}
             className="bg-blue-600 text-white px-4 py-3 rounded-xl font-medium active:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors whitespace-nowrap"
           >
             Send
@@ -510,6 +765,124 @@ export default function Home() {
           onApprove={handleApprove}
           onDeny={handleDeny}
         />
+      )}
+      {state.gatingRequired && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-gray-900 rounded-xl shadow-xl max-w-md w-full max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="p-4 flex-shrink-0">
+              <p className="text-white font-medium">Uncommitted changes</p>
+              <p className="text-gray-400 text-sm mt-1">
+                {state.gatingRequired.chatId ? 'Commit, stash, or discard changes to continue.' : 'Commit or stash in your repo, then try again.'}
+              </p>
+              {state.gatingRequired.remediateError && (
+                <p className="text-amber-400 text-sm mt-2">{state.gatingRequired.remediateError}</p>
+              )}
+            </div>
+            <div className="px-4 overflow-y-auto flex-1 min-h-0 text-sm">
+              <p className="text-gray-400">
+                Staged: {state.gatingRequired.stagedCount} · Unstaged: {state.gatingRequired.unstagedCount} · Untracked: {state.gatingRequired.untrackedCount}
+                {state.gatingRequired.truncated && ' (list truncated)'}
+              </p>
+              {((state.gatingRequired.stagedFiles?.length ?? 0) + (state.gatingRequired.unstagedFiles?.length ?? 0) + (state.gatingRequired.untrackedNotIgnoredFiles?.length ?? 0)) > 0 && (
+                <ul className="mt-2 space-y-0.5 text-gray-500 text-xs font-mono break-all">
+                  {state.gatingRequired.stagedFiles?.slice(0, 30).map(f => <li key={f}>S: {f}</li>)}
+                  {state.gatingRequired.unstagedFiles?.slice(0, 30).map(f => <li key={f}>U: {f}</li>)}
+                  {state.gatingRequired.untrackedNotIgnoredFiles?.slice(0, 30).map(f => <li key={f}>?: {f}</li>)}
+                </ul>
+              )}
+            </div>
+            {!state.gatingRequired.chatId ? (
+              <div className="p-4 flex justify-end border-t border-gray-800">
+                <button onClick={dismissGating} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">Cancel</button>
+              </div>
+            ) : !gatingDiscardConfirm ? (
+              <>
+                <div className="px-4 py-2">
+                  <input
+                    type="text"
+                    value={gatingRemediateMessage}
+                    onChange={e => setGatingRemediateMessage(e.target.value)}
+                    placeholder="Message (optional for commit/stash)"
+                    className="w-full bg-gray-800 text-white rounded-lg px-3 py-2 text-sm border border-gray-700 focus:border-blue-500 outline-none"
+                  />
+                </div>
+                <div className="p-4 flex flex-wrap gap-2 justify-end border-t border-gray-800">
+                  <button onClick={dismissGating} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">Cancel</button>
+                  <button onClick={() => sendRemediate('commit', gatingRemediateMessage)} className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-500">Commit</button>
+                  <button onClick={() => sendRemediate('stash', gatingRemediateMessage)} className="px-3 py-1.5 text-sm bg-gray-600 text-white rounded-lg hover:bg-gray-500">Stash</button>
+                  <button onClick={() => setGatingDiscardConfirm(true)} className="px-3 py-1.5 text-sm bg-red-900/60 text-red-300 rounded-lg hover:bg-red-900/80">Discard</button>
+                </div>
+              </>
+            ) : (
+              <div className="p-4 border-t border-gray-800">
+                <p className="text-red-300 text-sm mb-2">Are you sure? Discard cannot be undone.</p>
+                <div className="flex gap-2 justify-end">
+                  <button onClick={() => setGatingDiscardConfirm(false)} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">Back</button>
+                  <button onClick={() => { sendRemediate('discard'); setGatingDiscardConfirm(false); }} className="px-3 py-1.5 text-sm bg-red-600 text-white rounded-lg hover:bg-red-500">Discard all</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {showSwitchBranch && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-gray-900 rounded-xl shadow-xl max-w-md w-full p-4 flex flex-col gap-3">
+            <p className="text-white font-medium">Switch branch</p>
+            <input
+              type="text"
+              value={switchBranchName}
+              onChange={e => setSwitchBranchName(e.target.value)}
+              placeholder="branch name"
+              className="bg-gray-800 text-white rounded-lg px-3 py-2 text-sm border border-gray-700 focus:border-blue-500 outline-none"
+              autoFocus
+            />
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => { setShowSwitchBranch(false); setSwitchBranchName(''); }} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">Cancel</button>
+              <button
+                onClick={() => { if (switchBranchName.trim()) { handleSwitchBranch(switchBranchName.trim()); setShowSwitchBranch(false); setSwitchBranchName(''); } }}
+                disabled={!switchBranchName.trim()}
+                className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-500 disabled:opacity-50"
+              >
+                Switch
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {showAddProject && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="bg-gray-900 rounded-xl shadow-xl max-w-md w-full p-4 flex flex-col gap-3">
+            <p className="text-white font-medium">Add project</p>
+            <p className="text-gray-400 text-sm">Enter the absolute path to a git repo under an allowed root.</p>
+            <input
+              type="text"
+              value={addProjectPath}
+              onChange={e => setAddProjectPath(e.target.value)}
+              placeholder={allowedRoots[0] || '/path/to/project'}
+              className="bg-gray-800 text-white rounded-lg px-3 py-2 text-sm border border-gray-700 focus:border-blue-500 outline-none"
+              autoFocus
+            />
+            {state.addProjectError && (
+              <p className="text-xs text-red-400">{state.addProjectError}</p>
+            )}
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setShowAddProject(false); setAddProjectPath(''); dispatch({ type: 'SET_ADD_PROJECT_ERROR', error: null }); }}
+                className="px-3 py-1.5 text-sm text-gray-300 hover:text-white"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAddProject}
+                disabled={!addProjectPath.trim()}
+                className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:pointer-events-none"
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

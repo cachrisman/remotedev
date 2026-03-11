@@ -57,6 +57,8 @@ node --test test/path-validator.test.js
 node --test test/redos.test.js
 node --test test/session-manager.test.js
 node --test test/wal.test.js
+node --test test/git.test.js
+node --test test/validate-project-path.test.js
 ```
 
 ---
@@ -77,7 +79,7 @@ Tests the HMAC assertion layer that gates WebSocket upgrades.
 
 ### 2. `db.test.js`
 
-Tests the SQLite persistence layer (`db.js`).
+Tests the SQLite persistence layer (`db.js`). Includes Chat-Branch Policy: **projects** (insertProject, listProjects, updateProjectLastUsed), **listChatsByProject**, **getSessionRow** with chat columns, **isBranchLeasedByOther**.
 
 - Session CRUD: `insertSession`, `updateSessionState`, `updateSessionEnd`
 - Transcript batch insert followed by a tail query that respects the `maxRows` limit
@@ -107,7 +109,27 @@ Tests `validatePath()`, the function that prevents path traversal outside `ALLOW
 - `null` argument: rejected
 - Symlink whose real path resolves outside the root: rejected
 
-### 5. `redos.test.js`
+### 4a. `validate-project-path.test.js`
+
+Tests `validateProjectPath()` used for add_project: path must exist, be a directory, be under allowed roots, and be a git repo.
+
+- Non-existent path → PATH_NOT_FOUND
+- Path that is a file (not directory) → PATH_NOT_FOUND
+- Path outside allowed root → NOT_WITHIN_ALLOWED_ROOTS
+- Directory under root that is not a git repo → NOT_A_GIT_REPO
+- Valid git repo under root → safe and resolvedPath
+
+### 5. `git.test.js`
+
+Tests `bridge-server/git.js`: repo status, safe-state gating, and remediation.
+
+- **getRepoStatus**: isGitRepo, currentBranch, hasStaged/hasUnstaged, untracked list
+- **assertSafeOrReturnDetails**: safe for clean repo; safe: false with counts when untracked; safe: false for non-git dir
+- **commitAll** / **stashAll** / **discardAll**: remediation and resulting safe state
+- **Gating flow**: dirty repo → safe: false; after commitAll → safe: true
+- **isRiskyForCheckpoint**: true for .env; false for clean repo
+
+### 6. `redos.test.js`
 
 Tests the ReDoS protection layer for path input.
 
@@ -116,7 +138,7 @@ Tests the ReDoS protection layer for path input.
 - `null` input returns `null`
 - Empty string input returns `null`
 
-### 6. `session-manager.test.js`
+### 7. `session-manager.test.js`
 
 Tests the in-memory session registry.
 
@@ -126,7 +148,7 @@ Tests the in-memory session registry.
 - `activeCount` excludes sessions in `IDLE` state
 - Controller lifecycle: `setController` associates a WebSocket, `releaseController` clears it, attempting release with a wrong session ID is a no-op
 
-### 7. `wal.test.js`
+### 8. `wal.test.js`
 
 Tests the WAL checkpoint scheduler.
 
@@ -269,6 +291,15 @@ These run only when `--skip-manual` is not passed. Each requires a human to perf
 6. **visibilitychange reconnect** — Background the app (trigger `visibilitychange`); foreground it; confirm reconnect
 7. **Bash APPROVE** — At an approval prompt, type an incorrect confirmation string; confirm it is blocked; type the correct string; confirm approval proceeds
 8. **client_error telemetry** — Send a malformed chunk to the bridge; confirm a `client_error` event appears in the bridge log
+
+### Manual tests: Chat-Branch Policy (v0.17)
+
+When the bridge and UI are running with multiple allowed roots (or you want to exercise the project/chats flow):
+
+1. **Add project** — In the UI, use "Add project" and enter the absolute path to a git repo under an allowed root. Confirm the project appears in the list. Try an invalid path (non-existent, outside root, or non-git dir) and confirm the UI shows the appropriate error (PATH_NOT_FOUND, NOT_WITHIN_ALLOWED_ROOTS, NOT_A_GIT_REPO).
+2. **Select project** — Select a project from the list; confirm chats for that project appear (or empty) and "New chat" is available.
+3. **Gating (switch chat / switch branch)** — With two or more chats in the same project, make the working tree dirty (e.g. create an untracked file or modify a tracked file). Switch to another chat (or switch branch). Confirm the gating modal appears with staged/unstaged/untracked counts and file list. Choose Commit or Stash (with optional message) and confirm the switch completes. Optionally test Discard (confirm second confirmation is required) and that the switch completes after remediation.
+4. **Idle timeout checkpoint** — (Optional; requires waiting or mocking 12h.) Leave a chat ACTIVE and idle for the configured idle timeout; confirm the bridge runs a checkpoint (commit or stash) and marks the chat PAUSED. Check audit_log and session row for checkpoint_type/checkpoint_ref.
 
 ---
 

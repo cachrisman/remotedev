@@ -12,9 +12,11 @@ const db = require('./db');
 const auth = require('./auth');
 const sessionManager = require('./session-manager');
 const Session = require('./session');
-const { resolveAllowedRoots } = require('./path-validator');
+const { resolveAllowedRoots, validateProjectPath } = require('./path-validator');
+const gitHelper = require('./git');
 const { runStartupChecks } = require('./startup-checks');
 const { startOrphanScan } = require('./orphan-scan');
+const { startIdleCheckInterval } = require('./idle-checkpoint');
 
 // ──────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -133,7 +135,7 @@ function handleConnection(ws, req) {
   }
 
   let isAuthed = false;
-  let sessionId = null;
+  const connectionState = { sessionId: null, activeProjectPath: null };
   let authTimeout;
 
   // Auth timeout — 5s to authenticate
@@ -175,9 +177,10 @@ function handleConnection(ws, req) {
       return;
     }
 
-    // Validate controller epoch on all mutating messages
+    // Validate controller epoch on mutating messages only (list_projects/list_chats stay ungated)
     const mutatingTypes = new Set([
       'create_session', 'input', 'stop', 'approval_response', 'resume_session',
+      'add_project', 'select_project', 'create_chat', 'switch_chat', 'switch_branch', 'archive_chat', 'remediate',
     ]);
 
     if (mutatingTypes.has(msg.type)) {
@@ -193,9 +196,7 @@ function handleConnection(ws, req) {
     }
 
     // Route message
-    routeMessage(ws, ip, msg, () => {
-      sessionId = msg.sessionId || sessionId;
-    });
+    routeMessage(ws, ip, msg, connectionState);
   });
 
   ws.on('close', (code, reason) => {
@@ -210,7 +211,7 @@ function handleConnection(ws, req) {
     const intentional = [1000, 1001, 4403].includes(code);
 
     // Release controller + disconnect current session
-    const session = sessionId ? sessionManager.get(sessionId) : null;
+    const session = connectionState.sessionId ? sessionManager.get(connectionState.sessionId) : null;
     if (session && !session.destroyed) {
       session.onDisconnect(intentional);
     }
@@ -267,10 +268,350 @@ function handleAuthenticate(ws, ip, msg, cb) {
   cb(true, epoch);
 }
 
-function routeMessage(ws, ip, msg, onSession) {
+function buildStateSyncPayload(sessionId, sessionState, connectionState) {
+  const projects = db.listProjects();
+  const payload = {
+    projects,
+    activeProjectPath: connectionState.activeProjectPath ?? null,
+  };
+  if (sessionState) {
+    payload.state = sessionState.state;
+    payload.sessionId = sessionId;
+    payload.seq = sessionState.seq;
+    payload.lastAck = sessionState.lastAck;
+    payload.pendingApproval = sessionState.pendingApproval ?? null;
+  }
+  if (connectionState.activeProjectPath) {
+    payload.chats = db.listChatsByProject(connectionState.activeProjectPath);
+  } else {
+    payload.chats = [];
+  }
+  return payload;
+}
+
+function routeMessage(ws, ip, msg, connectionState) {
   const { type, payload, sessionId } = msg;
+  if (msg.sessionId) connectionState.sessionId = msg.sessionId || connectionState.sessionId;
 
   switch (type) {
+    case 'list_projects': {
+      const projects = db.listProjects();
+      sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, {
+        projects,
+        activeProjectPath: connectionState.activeProjectPath ?? null,
+        chats: connectionState.activeProjectPath ? db.listChatsByProject(connectionState.activeProjectPath) : [],
+      }));
+      break;
+    }
+
+    case 'add_project': {
+      const projectPath = payload?.projectPath;
+      if (!projectPath || typeof projectPath !== 'string') {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'PATH_NOT_FOUND' }));
+        return;
+      }
+      const check = validateProjectPath(projectPath, resolvedRoots);
+      if (!check.safe) {
+        sendMsg(ws, buildMsg('error', null, { message: check.error || 'PATH_NOT_FOUND', subtype: check.error }));
+        return;
+      }
+      db.insertProject(check.resolvedPath);
+      const syntheticSessionId = `__project__:${check.resolvedPath}`;
+      db.insertAuditLog(syntheticSessionId, null, 'add_project', { projectPath: check.resolvedPath });
+      sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, {
+        projects: db.listProjects(),
+        activeProjectPath: connectionState.activeProjectPath ?? null,
+        chats: connectionState.activeProjectPath ? db.listChatsByProject(connectionState.activeProjectPath) : [],
+      }));
+      break;
+    }
+
+    case 'select_project': {
+      const projectPath = payload?.projectPath;
+      if (!projectPath || typeof projectPath !== 'string') {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'PATH_NOT_FOUND' }));
+        return;
+      }
+      const check = validateProjectPath(projectPath, resolvedRoots);
+      if (!check.safe) {
+        sendMsg(ws, buildMsg('error', null, { message: check.error || 'PATH_NOT_FOUND', subtype: check.error }));
+        return;
+      }
+      connectionState.activeProjectPath = check.resolvedPath;
+      db.updateProjectLastUsed(check.resolvedPath);
+      const syntheticSessionId = `__project__:${check.resolvedPath}`;
+      db.insertAuditLog(syntheticSessionId, null, 'select_project', { projectPath: check.resolvedPath });
+      sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, {
+        projects: db.listProjects(),
+        activeProjectPath: connectionState.activeProjectPath,
+        chats: db.listChatsByProject(connectionState.activeProjectPath),
+      }));
+      break;
+    }
+
+    case 'list_chats': {
+      const projectPath = payload?.projectPath;
+      if (!projectPath || typeof projectPath !== 'string') {
+        sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, { projects: db.listProjects(), activeProjectPath: connectionState.activeProjectPath ?? null, chats: [] }));
+        break;
+      }
+      const check = validateProjectPath(projectPath, resolvedRoots);
+      const chats = check.safe ? db.listChatsByProject(check.resolvedPath) : [];
+      sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, {
+        projects: db.listProjects(),
+        activeProjectPath: connectionState.activeProjectPath ?? null,
+        chats,
+      }));
+      break;
+    }
+
+    case 'switch_chat': {
+      const chatId = payload?.chatId;
+      if (!chatId) {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'not_found' }));
+        return;
+      }
+      const chatRow = db.getSessionRow(chatId);
+      if (!chatRow) {
+        sendMsg(ws, buildMsg('error', chatId, { message: 'session_not_found', subtype: 'not_found' }));
+        return;
+      }
+      if (db.isBranchLeasedByOther(chatRow.project_path, chatRow.current_branch, chatId)) {
+        sendMsg(ws, buildMsg('error', chatId, { message: 'branch_in_use', subtype: 'branch_in_use' }));
+        return;
+      }
+      const safeCheck = gitHelper.assertSafeOrReturnDetails(chatRow.project_path);
+      if (!safeCheck.safe) {
+        sendGatingRequired(ws, connectionState, chatId, safeCheck);
+        return;
+      }
+      const coResult = gitHelper.git(chatRow.project_path, ['checkout', chatRow.current_branch]);
+      if (coResult.status !== 0) {
+        sendMsg(ws, buildMsg('error', chatId, { message: 'checkout_failed', subtype: 'git_checkout_failed' }));
+        return;
+      }
+      connectionState.sessionId = chatId;
+      connectionState.activeProjectPath = chatRow.project_path;
+      db.updateProjectLastUsed(chatRow.project_path);
+      if (chatRow.chat_status === 'PAUSED') {
+        db.updateSessionChatFields(chatId, { chat_status: 'ACTIVE' });
+      }
+      db.insertAuditLog(chatId, null, 'switch_chat', { targetChatId: chatId, currentBranch: chatRow.current_branch });
+      const session = sessionManager.get(chatId);
+      if (session && !session.destroyed) {
+        session.attachWs(ws);
+        sendMsg(ws, buildMsg('state_sync', chatId, {
+          state: session.state,
+          sessionId: chatId,
+          seq: session.seq,
+          lastAck: session.lastAck,
+          pendingApproval: session.pendingApproval ?? null,
+          activeChatId: chatId,
+          currentBranch: chatRow.current_branch,
+          projects: db.listProjects(),
+          activeProjectPath: connectionState.activeProjectPath,
+          chats: db.listChatsByProject(chatRow.project_path),
+        }));
+      } else {
+        sendMsg(ws, buildMsg('state_sync', chatId, {
+          state: 'IDLE',
+          sessionId: chatId,
+          seq: 0,
+          lastAck: 0,
+          activeChatId: chatId,
+          currentBranch: chatRow.current_branch,
+          projects: db.listProjects(),
+          activeProjectPath: connectionState.activeProjectPath,
+          chats: db.listChatsByProject(chatRow.project_path),
+        }));
+      }
+      break;
+    }
+
+    case 'archive_chat': {
+      const chatId = payload?.chatId;
+      if (!chatId) {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'not_found' }));
+        return;
+      }
+      const chatRow = db.getSessionRow(chatId);
+      if (!chatRow) {
+        sendMsg(ws, buildMsg('error', chatId, { message: 'session_not_found', subtype: 'not_found' }));
+        return;
+      }
+      const now = Date.now();
+      db.updateSessionChatFields(chatId, { archived_at: now, chat_status: 'ARCHIVED' });
+      db.insertAuditLog(chatId, null, 'archive_chat', { chatId });
+      sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, {
+        projects: db.listProjects(),
+        activeProjectPath: connectionState.activeProjectPath ?? null,
+        chats: connectionState.activeProjectPath ? db.listChatsByProject(connectionState.activeProjectPath) : [],
+      }));
+      break;
+    }
+
+    case 'switch_branch': {
+      const branchName = payload?.branchName;
+      if (!branchName || typeof branchName !== 'string') {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'BRANCH_NOT_FOUND' }));
+        return;
+      }
+      const activeChatId = connectionState.sessionId;
+      const projectPath = connectionState.activeProjectPath;
+      if (!projectPath) {
+        sendMsg(ws, buildMsg('error', null, { message: 'no_project_selected', subtype: 'no_project_selected' }));
+        return;
+      }
+      if (db.isBranchLeasedByOther(projectPath, branchName, activeChatId)) {
+        sendMsg(ws, buildMsg('error', activeChatId, { message: 'branch_in_use', subtype: 'branch_in_use' }));
+        return;
+      }
+      const safeCheck = gitHelper.assertSafeOrReturnDetails(projectPath);
+      if (!safeCheck.safe) {
+        sendGatingRequired(ws, connectionState, activeChatId, safeCheck);
+        return;
+      }
+      const refLocal = gitHelper.git(projectPath, ['show-ref', '--verify', `refs/heads/${branchName}`]);
+      const refOrigin = gitHelper.git(projectPath, ['show-ref', '--verify', `refs/remotes/origin/${branchName}`]);
+      if (refLocal.status === 0) {
+        const co = gitHelper.git(projectPath, ['checkout', branchName]);
+        if (co.status !== 0) {
+          sendMsg(ws, buildMsg('error', activeChatId, { message: 'checkout_failed', subtype: 'git_checkout_failed' }));
+          return;
+        }
+      } else if (refOrigin.status === 0) {
+        const co = gitHelper.git(projectPath, ['checkout', '-b', branchName, '--track', `origin/${branchName}`]);
+        if (co.status !== 0) {
+          sendMsg(ws, buildMsg('error', activeChatId, { message: 'checkout_failed', subtype: 'git_checkout_failed' }));
+          return;
+        }
+      } else {
+        sendMsg(ws, buildMsg('error', activeChatId, { message: 'BRANCH_NOT_FOUND', subtype: 'BRANCH_NOT_FOUND' }));
+        return;
+      }
+      if (activeChatId) {
+        db.updateSessionChatFields(activeChatId, { current_branch: branchName });
+        db.insertAuditLog(activeChatId, null, 'switch_branch', { branchName });
+      }
+      sendMsg(ws, buildMsg('state_sync', connectionState.sessionId, {
+        state: connectionState.sessionId ? (sessionManager.get(connectionState.sessionId)?.state || 'IDLE') : 'IDLE',
+        sessionId: connectionState.sessionId,
+        activeChatId: connectionState.sessionId,
+        currentBranch: branchName,
+        projects: db.listProjects(),
+        activeProjectPath: connectionState.activeProjectPath,
+        chats: connectionState.activeProjectPath ? db.listChatsByProject(connectionState.activeProjectPath) : [],
+      }));
+      break;
+    }
+
+    case 'remediate': {
+      const chatId = payload?.chatId;
+      const action = payload?.action;
+      if (!chatId || !action || !['commit', 'stash', 'discard'].includes(action)) {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'invalid_remediate' }));
+        return;
+      }
+      const chatRow = db.getSessionRow(chatId);
+      if (!chatRow || !chatRow.project_path) {
+        sendMsg(ws, buildMsg('error', chatId, { message: 'session_not_found', subtype: 'not_found' }));
+        return;
+      }
+      const workingDir = chatRow.project_path;
+      const allowed = resolvedRoots.some(root => workingDir === root || workingDir.startsWith(root + path.sep));
+      if (!allowed) {
+        sendMsg(ws, buildMsg('error', chatId, { message: 'NOT_WITHIN_ALLOWED_ROOTS', subtype: 'NOT_WITHIN_ALLOWED_ROOTS' }));
+        return;
+      }
+      const message = (payload?.message || `remediate ${action}`).trim().slice(0, 500);
+      if (action === 'commit') {
+        const ok = gitHelper.commitAll(workingDir, message || 'checkpoint');
+        if (!ok) {
+          const after = gitHelper.assertSafeOrReturnDetails(workingDir);
+          sendMsg(ws, buildMsg('remediate_result', chatId, { safe: after.safe, ...after }));
+          return;
+        }
+      } else if (action === 'stash') {
+        const ok = gitHelper.stashAll(workingDir, message || 'stash', true);
+        if (!ok) {
+          const after = gitHelper.assertSafeOrReturnDetails(workingDir);
+          sendMsg(ws, buildMsg('remediate_result', chatId, { safe: after.safe, ...after }));
+          return;
+        }
+      } else {
+        gitHelper.discardAll(workingDir);
+      }
+      const after = gitHelper.assertSafeOrReturnDetails(workingDir);
+      sendMsg(ws, buildMsg('remediate_result', chatId, {
+        safe: after.safe,
+        stagedCount: after.stagedCount,
+        unstagedCount: after.unstagedCount,
+        untrackedCount: after.untrackedCount,
+        truncated: after.truncated ?? false,
+      }));
+      break;
+    }
+
+    case 'create_chat': {
+      const projectPath = payload?.projectPath;
+      const name = (payload?.name || 'chat').trim().replace(/\s+/g, '-').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 40) || 'chat';
+      if (!projectPath || typeof projectPath !== 'string') {
+        sendMsg(ws, buildMsg('error', null, { message: 'invalid_payload', subtype: 'PATH_NOT_FOUND' }));
+        return;
+      }
+      const safeCheck = gitHelper.assertSafeOrReturnDetails(projectPath);
+      if (!safeCheck.safe) {
+        sendGatingRequired(ws, connectionState, null, safeCheck);
+        return;
+      }
+      const check = validateProjectPath(projectPath, resolvedRoots);
+      if (!check.safe) {
+        sendMsg(ws, buildMsg('error', null, { message: check.error || 'PATH_NOT_FOUND', subtype: check.error }));
+        return;
+      }
+      const resolvedPath = check.resolvedPath;
+      const branchResult = gitHelper.git(resolvedPath, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      const baseBranch = branchResult.stdout || 'main';
+      const now = new Date();
+      const dateStr = now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0');
+      const id = crypto.randomUUID();
+      const shortId = id.slice(0, 5);
+      const slug = (payload?.name || 'chat').trim().replace(/\s+/g, '-').replace(/[^a-zA-Z0-9-]/g, '').slice(0, 30) || 'chat';
+      const primaryBranch = `chat/${dateStr}/${shortId}-${slug}`;
+      const checkoutResult = gitHelper.git(resolvedPath, ['checkout', '-b', primaryBranch]);
+      if (checkoutResult.status !== 0) {
+        sendMsg(ws, buildMsg('error', null, { message: 'branch_creation_failed', subtype: 'git_checkout_failed' }));
+        return;
+      }
+      db.insertSession(id, name, resolvedPath, {
+        projectPath: resolvedPath,
+        chatStatus: 'ACTIVE',
+        primaryBranch,
+        currentBranch: primaryBranch,
+      });
+      const session = sessionManager.create(Session, id, name, resolvedPath, { skipDbInsert: true });
+      session.attachWs(ws);
+      session.resolvedRoots = resolvedRoots;
+      sessionManager.setController(id);
+      session._resetHeartbeatTimer();
+      db.insertAuditLog(id, null, 'create_chat', { projectPath: resolvedPath, name: payload?.name, baseBranch, primaryBranch });
+      connectionState.sessionId = id;
+      connectionState.activeProjectPath = resolvedPath;
+      db.updateProjectLastUsed(resolvedPath);
+      sendMsg(ws, buildMsg('state_sync', id, {
+        state: 'IDLE',
+        sessionId: id,
+        seq: 0,
+        lastAck: 0,
+        activeChatId: id,
+        currentBranch: primaryBranch,
+        projects: db.listProjects(),
+        activeProjectPath: connectionState.activeProjectPath,
+        chats: db.listChatsByProject(resolvedPath),
+      }));
+      break;
+    }
+
     case 'create_session': {
       const id = crypto.randomUUID();
       const name = payload?.name || 'session';
@@ -294,7 +635,7 @@ function routeMessage(ws, ip, msg, onSession) {
       session._resetHeartbeatTimer();
 
       db.insertAuditLog(id, null, 'session_created', { name, workingDir });
-      onSession();
+      connectionState.sessionId = id;
 
       sendMsg(ws, buildMsg('state_sync', id, {
         state: 'IDLE', sessionId: id, seq: 0, lastAck: 0,
@@ -414,6 +755,22 @@ function sendMsg(ws, msg) {
   } catch {}
 }
 
+/** Send gating_required with consistent payload. Envelope sessionId is always a string (chatId, connection session, or __bridge__ sentinel). UI uses payload.chatId only; envelope is for routing only. */
+function sendGatingRequired(ws, connectionState, chatId, safeCheck) {
+  const envelopeSessionId = typeof chatId === 'string' ? chatId
+    : (typeof connectionState.sessionId === 'string' ? connectionState.sessionId : '__bridge__');
+  sendMsg(ws, buildMsg('gating_required', envelopeSessionId, {
+    chatId: typeof chatId === 'string' ? chatId : null,
+    stagedCount: safeCheck.stagedCount,
+    unstagedCount: safeCheck.unstagedCount,
+    untrackedCount: safeCheck.untrackedCount,
+    stagedFiles: safeCheck.stagedFiles || [],
+    unstagedFiles: safeCheck.unstagedFiles || [],
+    untrackedNotIgnoredFiles: safeCheck.untrackedNotIgnoredFiles || [],
+    truncated: safeCheck.truncated ?? false,
+  }));
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Main
 
@@ -423,6 +780,7 @@ async function main() {
 
   // DB
   db.openDb();
+  startIdleCheckInterval();
 
   const dbDir = path.join(process.env.HOME || '/tmp', '.local', 'share', 'remotedev');
   runStartupChecks({

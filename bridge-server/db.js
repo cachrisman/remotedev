@@ -34,8 +34,11 @@ function openDb() {
   return db;
 }
 
+const SCHEMA_VERSION = 2;
+
 function migrate() {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -84,7 +87,50 @@ function migrate() {
 
     CREATE INDEX IF NOT EXISTS client_errors_session
       ON client_errors(session_id, ts);
+
+    CREATE TABLE IF NOT EXISTS projects (
+      project_path TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL,
+      last_used_at INTEGER
+    );
   `);
+
+  // Ensure schema_version has a row (initial version 1)
+  const versionRow = db.prepare('SELECT version FROM schema_version LIMIT 1').get();
+  if (!versionRow) {
+    db.prepare('INSERT INTO schema_version (version) VALUES (1)').run();
+  }
+
+  const currentVersion = db.prepare('SELECT version FROM schema_version LIMIT 1').get()?.version ?? 1;
+  if (currentVersion < 2) {
+    // Add chat/branch columns to sessions
+    const alterColumns = [
+      'ALTER TABLE sessions ADD COLUMN project_path TEXT',
+      'ALTER TABLE sessions ADD COLUMN chat_status TEXT',
+      'ALTER TABLE sessions ADD COLUMN primary_branch TEXT',
+      'ALTER TABLE sessions ADD COLUMN current_branch TEXT',
+      'ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER',
+      'ALTER TABLE sessions ADD COLUMN paused_at INTEGER',
+      'ALTER TABLE sessions ADD COLUMN archived_at INTEGER',
+      'ALTER TABLE sessions ADD COLUMN checkpoint_type TEXT',
+      'ALTER TABLE sessions ADD COLUMN checkpoint_ref TEXT',
+      'ALTER TABLE sessions ADD COLUMN checkpoint_at INTEGER',
+    ];
+    for (const sql of alterColumns) {
+      try {
+        db.exec(sql);
+      } catch (err) {
+        if (!err.message.includes('duplicate column name')) throw err;
+      }
+    }
+    // Backfill: existing sessions get chat_status=ACTIVE, project_path from working_dir
+    db.prepare(
+      `UPDATE sessions SET chat_status = 'ACTIVE', project_path = working_dir, last_activity_at = created_at
+       WHERE chat_status IS NULL`
+    ).run();
+    db.prepare('UPDATE schema_version SET version = ?').run(SCHEMA_VERSION);
+    logger.info('DB migrated to schema version 2');
+  }
 }
 
 function pruneRetention() {
@@ -129,11 +175,16 @@ function pruneRetention() {
   }
 }
 
-function insertSession(id, name, workingDir) {
+function insertSession(id, name, workingDir, opts = {}) {
+  const now = Date.now();
+  const projectPath = opts.projectPath ?? null;
+  const chatStatus = opts.chatStatus ?? 'ACTIVE';
+  const primaryBranch = opts.primaryBranch ?? null;
+  const currentBranch = opts.currentBranch ?? null;
   db.prepare(
-    `INSERT INTO sessions (id, name, working_dir, state, created_at)
-     VALUES (?, ?, ?, 'IDLE', ?)`
-  ).run(id, name, workingDir, Date.now());
+    `INSERT INTO sessions (id, name, working_dir, state, created_at, project_path, chat_status, primary_branch, current_branch, last_activity_at)
+     VALUES (?, ?, ?, 'IDLE', ?, ?, ?, ?, ?, ?)`
+  ).run(id, name, workingDir, now, projectPath, chatStatus, primaryBranch, currentBranch, now);
 }
 
 function updateSessionState(id, state) {
@@ -146,6 +197,60 @@ function updateSessionEnd(id, reason) {
   db.prepare(
     `UPDATE sessions SET state = 'IDLE', ended_at = ?, end_reason = ? WHERE id = ?`
   ).run(Date.now(), reason, id);
+}
+
+function updateSessionChatFields(id, fields) {
+  const allowed = ['project_path', 'chat_status', 'primary_branch', 'current_branch', 'last_activity_at', 'paused_at', 'archived_at', 'checkpoint_type', 'checkpoint_ref', 'checkpoint_at'];
+  const updates = [];
+  const values = [];
+  for (const [key, value] of Object.entries(fields)) {
+    const col = key.replace(/([A-Z])/g, '_$1').toLowerCase().replace(/^_/, '');
+    if (allowed.includes(col)) {
+      updates.push(`${col} = ?`);
+      values.push(value);
+    }
+  }
+  if (updates.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE sessions SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+}
+
+function insertProject(projectPath) {
+  const now = Date.now();
+  db.prepare(
+    `INSERT OR IGNORE INTO projects (project_path, created_at, last_used_at) VALUES (?, ?, ?)`
+  ).run(projectPath, now, now);
+}
+
+function updateProjectLastUsed(projectPath) {
+  db.prepare(`UPDATE projects SET last_used_at = ? WHERE project_path = ?`).run(Date.now(), projectPath);
+}
+
+function listProjects() {
+  return db.prepare(
+    `SELECT project_path, created_at, last_used_at FROM projects ORDER BY last_used_at IS NULL, last_used_at DESC, created_at DESC`
+  ).all();
+}
+
+function listChatsByProject(projectPath) {
+  return db.prepare(
+    `SELECT id, name, working_dir, state, project_path, chat_status, primary_branch, current_branch, last_activity_at, paused_at, archived_at, checkpoint_type, checkpoint_ref, checkpoint_at, created_at
+     FROM sessions WHERE project_path = ? AND archived_at IS NULL ORDER BY last_activity_at IS NULL, last_activity_at DESC, created_at DESC`
+  ).all(projectPath);
+}
+
+function getSessionRow(id) {
+  return db.prepare(
+    `SELECT id, name, working_dir, state, project_path, chat_status, primary_branch, current_branch, last_activity_at, paused_at, archived_at, checkpoint_type, checkpoint_ref, checkpoint_at, created_at, ended_at, end_reason FROM sessions WHERE id = ?`
+  ).get(id);
+}
+
+/** Check if branch is leased by another ACTIVE/RUNNING chat in the same project (exclude chatId). */
+function isBranchLeasedByOther(projectPath, currentBranch, excludeChatId) {
+  const row = db.prepare(
+    `SELECT id FROM sessions WHERE project_path = ? AND current_branch = ? AND chat_status IN ('ACTIVE', 'RUNNING') AND id != ? LIMIT 1`
+  ).get(projectPath, currentBranch, excludeChatId || '');
+  return row != null;
 }
 
 function insertTranscriptBatch(rows) {
@@ -225,6 +330,13 @@ module.exports = {
   insertSession,
   updateSessionState,
   updateSessionEnd,
+  updateSessionChatFields,
+  insertProject,
+  updateProjectLastUsed,
+  listProjects,
+  listChatsByProject,
+  getSessionRow,
+  isBranchLeasedByOther,
   insertTranscriptBatch,
   getTranscriptTail,
   countRawStdoutLines,
