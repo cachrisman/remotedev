@@ -43,6 +43,9 @@ function validateAuthenticate(payload, bridgeAuthToken, clientSecret) {
   if (!wsAuth || !nonce || !ts || !incomingSecret) {
     return { ok: false, code: 4003, reason: 'missing_fields' };
   }
+  if (typeof wsAuth !== 'string' || typeof nonce !== 'string' || typeof incomingSecret !== 'string') {
+    return { ok: false, code: 4003, reason: 'missing_fields' };
+  }
 
   // Check timestamp within 30s
   const age = Date.now() - Number(ts);
@@ -58,7 +61,12 @@ function validateAuthenticate(payload, bridgeAuthToken, clientSecret) {
 
   // Verify HMAC
   const expected = computeHmac(bridgeAuthToken, `${nonce}:${ts}`);
-  if (!crypto.timingSafeEqual(Buffer.from(wsAuth), Buffer.from(expected))) {
+  const wsAuthBuf = Buffer.from(wsAuth, 'utf8');
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  if (wsAuthBuf.length !== expectedBuf.length) {
+    return { ok: false, code: 4003, reason: 'hmac_mismatch' };
+  }
+  if (!crypto.timingSafeEqual(wsAuthBuf, expectedBuf)) {
     return { ok: false, code: 4003, reason: 'hmac_mismatch' };
   }
 

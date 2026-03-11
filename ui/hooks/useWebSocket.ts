@@ -51,7 +51,6 @@ export function useWebSocket({
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const cachedTokenRef = useRef<{ wsAuth: string; nonce: string; ts: number; bridgeWsUrl: string; clientSecret: string } | null>(null);
   const failureCountRef = useRef(0);
   const destroyedRef = useRef(false);
   const epochRef = useRef<string | null>(controllerEpoch);
@@ -80,20 +79,17 @@ export function useWebSocket({
 
   const connect = useCallback(async () => {
     if (destroyedRef.current) return;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return;
+    if (wsRef.current && (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)) return;
 
     setConnectionState('connecting');
 
-    let token = cachedTokenRef.current;
-    if (!token) {
-      try {
-        token = await fetchToken();
-        cachedTokenRef.current = token;
-      } catch {
-        setConnectionState('error');
-        scheduleReconnect(2000);
-        return;
-      }
+    let token: Awaited<ReturnType<typeof fetchToken>>;
+    try {
+      token = await fetchToken();
+    } catch {
+      setConnectionState('error');
+      scheduleReconnect(2000);
+      return;
     }
 
     let ws: WebSocket;
@@ -108,6 +104,7 @@ export function useWebSocket({
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       setConnectionState('authenticating');
       // Send authenticate message
       ws.send(JSON.stringify({
@@ -125,10 +122,17 @@ export function useWebSocket({
     };
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return;
       let msg: BridgeMessage;
       try {
         msg = JSON.parse(event.data);
       } catch {
+        return;
+      }
+
+      // Protocol version mismatch
+      if (msg.v !== undefined && msg.v !== PROTOCOL_VERSION) {
+        ws.close(4400, 'protocol_version_mismatch');
         return;
       }
 
@@ -150,12 +154,6 @@ export function useWebSocket({
         return;
       }
 
-      // Protocol version mismatch
-      if (msg.v !== undefined && msg.v !== PROTOCOL_VERSION) {
-        ws.close(4400, 'protocol_version_mismatch');
-        return;
-      }
-
       // Update lastAck from pong
       if (msg.type === 'pong' && msg.payload?.seq != null) {
         lastAckRef.current = msg.payload.seq as number;
@@ -165,15 +163,14 @@ export function useWebSocket({
     };
 
     ws.onclose = (event) => {
+      if (wsRef.current !== ws) return;
       wsRef.current = null;
       const code = event.code;
 
       if (destroyedRef.current) return;
 
       if (code === 4003) {
-        // Token desync (e.g., after ./bin/reload) — clear cached token and retry
-        // Do NOT increment failure counter
-        cachedTokenRef.current = null;
+        // Assertion expired/replayed/token desync; fetch a fresh assertion and retry.
         setConnectionState('connecting');
         scheduleReconnect(500);
         return;
@@ -188,7 +185,6 @@ export function useWebSocket({
 
       if (code === 4400 || code === 4403) {
         // Protocol mismatch or stale epoch — reconnect cleanly
-        cachedTokenRef.current = null;
         setConnectionState('error');
         scheduleReconnect(2000);
         return;

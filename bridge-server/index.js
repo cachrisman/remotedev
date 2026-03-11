@@ -210,9 +210,10 @@ function handleConnection(ws, req) {
     const reasonStr = reason?.toString() || '';
     const intentional = [1000, 1001, 4403].includes(code);
 
-    // Release controller + disconnect current session
+    // Disconnect current session only if this WS is still attached.
+    // Prevent stale tab closes from disconnecting the active controller socket.
     const session = connectionState.sessionId ? sessionManager.get(connectionState.sessionId) : null;
-    if (session && !session.destroyed) {
+    if (session && !session.destroyed && session.ws === ws) {
       session.onDisconnect(intentional);
     }
 
@@ -236,7 +237,7 @@ function handleAuthenticate(ws, ip, msg, cb) {
   const result = auth.validateAuthenticate(msg.payload || msg, BRIDGE_AUTH_TOKEN, CLIENT_SECRET);
 
   if (!result.ok) {
-    const isStaleAssertion = result.reason === 'hmac_mismatch';
+    const isStaleAssertion = result.reason === 'assertion_expired' || result.reason === 'replay_detected';
     const locked = auth.recordAuthFailure(ip, { isStaleAssertion });
     logger.warn({ ip, reason: result.reason, locked }, 'Auth failed');
 
@@ -693,8 +694,7 @@ function routeMessage(ws, ip, msg, connectionState) {
       } else if (session.state === 'IDLE') {
         sendMsg(ws, buildMsg('state_sync', targetId, { state: 'IDLE', sessionId: targetId }));
       } else if (session.state === 'RUNNING' || session.state === 'AWAITING_APPROVAL') {
-        // Another tab tried to resume an active session
-        session.attachWs(ws);
+        // Another tab tried to resume an active session; do not steal the active socket.
         sendMsg(ws, buildMsg('session_busy', targetId, { state: session.state }));
       }
       break;

@@ -1,4 +1,5 @@
 # RemoteDev — Todo List
+Version: 2
 
 Status as of v0.16 initial implementation (February 2026).
 
@@ -125,6 +126,12 @@ Status as of v0.16 initial implementation (February 2026).
 ### Bug Fixes (During Review)
 - ✅ `session-manager.js`: `activePids()` called `.filter()/.map()` on `MapIterator` — fixed by spreading to array first (`[...this.#sessions.values()]`)
 - ✅ `test/path-validator.test.js`: TypeScript cast syntax `null as unknown as string` in a plain `.js` file — replaced with `null`
+- ✅ Auth hardening: `timingSafeEqual` now checks HMAC length before compare (prevents malformed-auth crash path)
+- ✅ Auth lockout accounting: only expired/replayed assertions are lockout-exempt; invalid HMAC attempts now count
+- ✅ Session ownership hardening: stale websocket closes can no longer disconnect the active session; busy resume no longer steals active socket
+- ✅ Reconnect/state hardening: PTY process liveness tracking fixed (`procExited`), approval responses validated, transcript replay made tolerant of raw rows
+- ✅ UI reconnect hardening: connection race guards added; protocol version validated before `authenticated`; stale closure in message handler removed
+- ✅ Dependency hardening: transitive `tar` updated to patched `7.5.11` via npm override (high advisory cleared)
 
 ---
 
@@ -287,3 +294,9 @@ These are documented limitations — intentional for v1:
 - [ ] Configurable HMAC assertion TTL
 - [ ] Automated TLS cert renewal via launchd
 - [ ] Prometheus / metrics endpoint for session health
+
+---
+
+## Changelog
+
+- Version 2 (2026-03-11): Updated status after stability hardening and audit remediation (auth/session/UI websocket fixes, transcript replay safety, and `tar` advisory mitigation).

@@ -1,4 +1,5 @@
 # RemoteDev v0.16 — Implementation Log
+Version: 2
 
 ## Overview
 
@@ -906,6 +907,35 @@ The following rounds of review led to targeted fixes before merge.
 - **UI:** remediate_result failure path **no longer uses state.gatingRequired**. Build payload from **msg and p only**: chatId from `msg.sessionId ?? p?.chatId` (then typeof check), counts and file lists from p (bridge already sends ...after on failure). remediateError unchanged. Avoids closure staleness.
 - **UI:** normalizeBranch already stripped refs/heads/; added **.replace(/^refs\/remotes\/origin\//, '').replace(/^origin\//, '')**. No UUID-style checks on sessionId found in bridge; __bridge__ only used as envelope for gating_required.
 
+### 8. Stability hardening pass (March 2026)
+
+**Root causes addressed:**
+
+- Auth comparisons used `timingSafeEqual` without pre-validating equal lengths, which can throw and terminate the bridge process.
+- Auth lockout classification incorrectly treated all `hmac_mismatch` failures as stale assertion failures, weakening brute-force protection.
+- Session disconnect/reconnect paths trusted `sessionId` without socket ownership checks; stale sockets could disconnect or steal active sessions.
+- Reconnect state restoration relied on `child_process` fields that are not available in `node-pty` sessions.
+- Approval response handling accepted mismatched request IDs.
+- Transcript replay assumed all persisted rows were JSON payloads.
+- UI websocket reconnect logic could race and use stale closures in message handling.
+
+**Changes made:**
+
+- Added strict HMAC length checks before `timingSafeEqual` and kept mismatch handling non-throwing.
+- Reclassified stale assertions to `assertion_expired`/`replay_detected`; `hmac_mismatch` now counts toward lockout.
+- Enforced socket ownership on disconnect handling (`session.ws === ws`) and removed WS reattachment from `session_busy` resume path.
+- Added explicit `procExited` tracking for PTY/pipe process lifecycle and used it in reconnect state restoration.
+- Validated approval responses (`requestId` must match pending request, `decision` must be `approve`/`deny`).
+- Made transcript replay tolerant of plain-text `raw_stdout` rows and skip malformed non-raw rows safely.
+- Reset backpressure timers on recovery, fixed warn→kill timer sequencing, and avoided stale-timer closures.
+- Updated orphan timeout behavior to refresh on disconnected stdout activity.
+- Hardened UI websocket connection logic against overlapping sockets and stale socket events.
+- Refactored UI message handling to use a live `stateRef` to avoid stale closure bugs during gating/remediation flows.
+
 ---
 
 *For the original specification, see `docs/PLAN.md`. For operational procedures, see `docs/USER_GUIDE.md`. For what to do next, see `docs/TODO.md`.*
+
+## Changelog
+
+- Version 2 (2026-03-11): Added a stability hardening pass covering auth crash prevention, lockout accounting fixes, session socket-ownership safeguards, reconnect/process-state correctness, safer transcript replay, UI websocket race fixes, and stale-state handling improvements.
