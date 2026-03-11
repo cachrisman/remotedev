@@ -1,7 +1,7 @@
 # Chat ↔ Branch Policy (Branch-only Isolation) — Canon
 
 ## Status
-**Canon for vNext** (post v0.16).
+**Implemented in v0.17.** Canon for branch-only isolation.
 
 ## Context
 

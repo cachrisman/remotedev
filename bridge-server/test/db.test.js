@@ -92,3 +92,63 @@ describe('db.insertClientError / countClientErrors', () => {
     assert.equal(count, 2);
   });
 });
+
+describe('db projects and chat fields', () => {
+  it('insertProject and listProjects', () => {
+    const projectPath = path.join(tmpDir, 'proj-' + crypto.randomUUID().slice(0, 8));
+    db.insertProject(projectPath);
+    const list = db.listProjects();
+    assert.ok(Array.isArray(list));
+    assert.ok(list.some(p => p.project_path === projectPath));
+  });
+
+  it('updateProjectLastUsed does not throw', () => {
+    const projectPath = path.join(tmpDir, 'proj-lastused');
+    db.insertProject(projectPath);
+    assert.doesNotThrow(() => db.updateProjectLastUsed(projectPath));
+  });
+
+  it('insertSession with chat opts and listChatsByProject', () => {
+    const projectPath = path.join(tmpDir, 'chat-proj');
+    const sessionId = crypto.randomUUID();
+    db.insertProject(projectPath);
+    db.insertSession(sessionId, 'chat-test', projectPath, {
+      projectPath,
+      chatStatus: 'ACTIVE',
+      primaryBranch: 'main',
+      currentBranch: 'main',
+    });
+    const chats = db.listChatsByProject(projectPath);
+    assert.equal(chats.length, 1);
+    assert.equal(chats[0].id, sessionId);
+    assert.equal(chats[0].chat_status, 'ACTIVE');
+    assert.equal(chats[0].current_branch, 'main');
+  });
+
+  it('getSessionRow returns chat columns', () => {
+    const projectPath = path.join(tmpDir, 'getrow-proj');
+    const sessionId = crypto.randomUUID();
+    db.insertSession(sessionId, 'row-test', projectPath, {
+      projectPath,
+      primaryBranch: 'feature/x',
+      currentBranch: 'feature/x',
+    });
+    const row = db.getSessionRow(sessionId);
+    assert.ok(row);
+    assert.equal(row.project_path, projectPath);
+    assert.equal(row.primary_branch, 'feature/x');
+    assert.equal(row.current_branch, 'feature/x');
+  });
+
+  it('isBranchLeasedByOther returns true when another chat has branch', () => {
+    const projectPath = path.join(tmpDir, 'lease-proj');
+    const id1 = crypto.randomUUID();
+    const id2 = crypto.randomUUID();
+    db.insertProject(projectPath);
+    db.insertSession(id1, 'c1', projectPath, { projectPath, chatStatus: 'ACTIVE', currentBranch: 'branch-a' });
+    db.insertSession(id2, 'c2', projectPath, { projectPath, chatStatus: 'PAUSED', currentBranch: 'branch-b' });
+    assert.equal(db.isBranchLeasedByOther(projectPath, 'branch-a', id2), true);
+    assert.equal(db.isBranchLeasedByOther(projectPath, 'branch-a', id1), false);
+    assert.equal(db.isBranchLeasedByOther(projectPath, 'branch-b', id1), false);
+  });
+});

@@ -382,15 +382,7 @@ function routeMessage(ws, ip, msg, connectionState) {
       }
       const safeCheck = gitHelper.assertSafeOrReturnDetails(chatRow.project_path);
       if (!safeCheck.safe) {
-        sendMsg(ws, buildMsg('gating_required', chatId, {
-          stagedCount: safeCheck.stagedCount,
-          unstagedCount: safeCheck.unstagedCount,
-          untrackedCount: safeCheck.untrackedCount,
-          stagedFiles: safeCheck.stagedFiles || [],
-          unstagedFiles: safeCheck.unstagedFiles || [],
-          untrackedNotIgnoredFiles: safeCheck.untrackedNotIgnoredFiles || [],
-          truncated: safeCheck.truncated ?? false,
-        }));
+        sendGatingRequired(ws, connectionState, chatId, safeCheck);
         return;
       }
       const coResult = gitHelper.git(chatRow.project_path, ['checkout', chatRow.current_branch]);
@@ -476,15 +468,7 @@ function routeMessage(ws, ip, msg, connectionState) {
       }
       const safeCheck = gitHelper.assertSafeOrReturnDetails(projectPath);
       if (!safeCheck.safe) {
-        sendMsg(ws, buildMsg('gating_required', activeChatId, {
-          stagedCount: safeCheck.stagedCount,
-          unstagedCount: safeCheck.unstagedCount,
-          untrackedCount: safeCheck.untrackedCount,
-          stagedFiles: safeCheck.stagedFiles || [],
-          unstagedFiles: safeCheck.unstagedFiles || [],
-          untrackedNotIgnoredFiles: safeCheck.untrackedNotIgnoredFiles || [],
-          truncated: safeCheck.truncated ?? false,
-        }));
+        sendGatingRequired(ws, connectionState, activeChatId, safeCheck);
         return;
       }
       const refLocal = gitHelper.git(projectPath, ['show-ref', '--verify', `refs/heads/${branchName}`]);
@@ -577,15 +561,7 @@ function routeMessage(ws, ip, msg, connectionState) {
       }
       const safeCheck = gitHelper.assertSafeOrReturnDetails(projectPath);
       if (!safeCheck.safe) {
-        sendMsg(ws, buildMsg('gating_required', null, {
-          stagedCount: safeCheck.stagedCount,
-          unstagedCount: safeCheck.unstagedCount,
-          untrackedCount: safeCheck.untrackedCount,
-          stagedFiles: safeCheck.stagedFiles || [],
-          unstagedFiles: safeCheck.unstagedFiles || [],
-          untrackedNotIgnoredFiles: safeCheck.untrackedNotIgnoredFiles || [],
-          truncated: safeCheck.truncated ?? false,
-        }));
+        sendGatingRequired(ws, connectionState, null, safeCheck);
         return;
       }
       const check = validateProjectPath(projectPath, resolvedRoots);
@@ -777,6 +753,22 @@ function sendMsg(ws, msg) {
   try {
     ws.send(JSON.stringify(msg));
   } catch {}
+}
+
+/** Send gating_required with consistent payload. Envelope sessionId is always a string (chatId, connection session, or __bridge__ sentinel). UI uses payload.chatId only; envelope is for routing only. */
+function sendGatingRequired(ws, connectionState, chatId, safeCheck) {
+  const envelopeSessionId = typeof chatId === 'string' ? chatId
+    : (typeof connectionState.sessionId === 'string' ? connectionState.sessionId : '__bridge__');
+  sendMsg(ws, buildMsg('gating_required', envelopeSessionId, {
+    chatId: typeof chatId === 'string' ? chatId : null,
+    stagedCount: safeCheck.stagedCount,
+    unstagedCount: safeCheck.unstagedCount,
+    untrackedCount: safeCheck.untrackedCount,
+    stagedFiles: safeCheck.stagedFiles || [],
+    unstagedFiles: safeCheck.unstagedFiles || [],
+    untrackedNotIgnoredFiles: safeCheck.untrackedNotIgnoredFiles || [],
+    truncated: safeCheck.truncated ?? false,
+  }));
 }
 
 // ──────────────────────────────────────────────────────────────────────────

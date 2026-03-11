@@ -236,7 +236,7 @@ function listChatsByProject(projectPath) {
   return db.prepare(
     `SELECT id, name, working_dir, state, project_path, chat_status, primary_branch, current_branch, last_activity_at, paused_at, archived_at, checkpoint_type, checkpoint_ref, checkpoint_at, created_at
      FROM sessions WHERE project_path = ? AND archived_at IS NULL ORDER BY last_activity_at IS NULL, last_activity_at DESC, created_at DESC`
-  ).all();
+  ).all(projectPath);
 }
 
 function getSessionRow(id) {
